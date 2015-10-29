@@ -3,7 +3,7 @@
 //  CouchbaseLite
 //
 //  Created by Jens Alfke on 6/20/11.
-//  Copyright 2011-2013 Couchbase, Inc.
+//  Copyright (c) 2011-2015 Couchbase, Inc.
 //
 //  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file
 //  except in compliance with the License. You may obtain a copy of the License at
@@ -20,8 +20,11 @@
 #import "CBLWebSocketChangeTracker.h"
 #import "CBLChangeMatcher.h"
 #import "CBLAuthorizer.h"
+#import "CBLClientCertAuthorizer.h"
+#import "CBLCookieStorage.h"
 #import "CBLMisc.h"
 #import "CBLStatus.h"
+#import "BLIPHTTPLogic.h"
 #import "MYURLUtils.h"
 #import "WebSocket.h"
 
@@ -46,7 +49,7 @@
 @synthesize lastSequenceID=_lastSequenceID, databaseURL=_databaseURL, mode=_mode;
 @synthesize limit=_limit, heartbeat=_heartbeat, error=_error, continuous=_continuous;
 @synthesize client=_client, filterName=_filterName, filterParameters=_filterParameters;
-@synthesize requestHeaders = _requestHeaders, authorizer=_authorizer;
+@synthesize requestHeaders = _requestHeaders, authorizer=_authorizer, cookieStorage=_cookieStorage;
 @synthesize docIDs = _docIDs, pollInterval=_pollInterval, usePOST=_usePOST;
 @synthesize paused=_paused;
 
@@ -161,7 +164,8 @@
                                        {@"style", (_includeConflicts ? @"all_docs" : nil)},
                                        {@"since", since},
                                        {@"limit", (_limit > 0 ? @(_limit) : nil)},
-                                       {@"filter", filterName});
+                                       {@"filter", filterName},
+                                       {@"accept_encoding", @"gzip"});
     if (filterName && filterParameters)
         [post addEntriesFromDictionary: filterParameters];
     return [CBLJSON dataWithJSONObject: post options: 0 error: NULL];
@@ -170,6 +174,7 @@
 - (NSDictionary*) TLSSettings {
     if (!_databaseURL.my_isHTTPS)
         return nil;
+    NSArray* clientCerts = $castIf(CBLClientCertAuthorizer, _authorizer).certificateChain;
     // Enable SSL for this connection.
     // Disable TLS 1.2 support because it breaks compatibility with some SSL servers;
     // workaround taken from Apple technote TN2287:
@@ -177,22 +182,15 @@
     // Disable automatic cert-chain checking, because that's the only way to allow self-signed
     // certs. We will check the cert later in -checkSSLCert.
     return $dict( {(id)kCFStreamSSLLevel, (id)kCFStreamSocketSecurityLevelTLSv1},
-                  {(id)kCFStreamSSLValidatesCertificateChain, @NO} );
+                  {(id)kCFStreamSSLValidatesCertificateChain, @NO},
+                  {(id)kCFStreamSSLCertificates, clientCerts});
 }
 
 
 - (BOOL) checkServerTrust: (SecTrustRef)sslTrust forURL: (NSURL*)url {
-    BOOL trusted = [_client changeTrackerApproveSSLTrust: sslTrust
+    return [_client changeTrackerApproveSSLTrust: sslTrust
                                                  forHost: url.host
                                                     port: (UInt16)url.port.intValue];
-    if (!trusted) {
-        //TODO: This error could be made more precise
-        LogTo(ChangeTracker, @"%@: Rejected server certificate", self);
-        [self failedWithError: [NSError errorWithDomain: NSURLErrorDomain
-                                                   code: NSURLErrorServerCertificateUntrusted
-                                               userInfo: nil]];
-    }
-    return trusted;
 }
 
 
@@ -210,6 +208,35 @@
 }
 
 - (BOOL) start {
+    if (!_http) {
+        // Initialize HTTPLogic before sending first request:
+        NSMutableURLRequest* urlRequest = [NSMutableURLRequest requestWithURL: self.changesFeedURL];
+        if (self.usePOST) {
+            urlRequest.HTTPMethod = @"POST";
+            urlRequest.HTTPBody = self.changesFeedPOSTBody;
+            [urlRequest setValue: @"application/json" forHTTPHeaderField: @"Content-Type"];
+        }
+
+        // Add headers from my .requestHeaders property:
+        [self.requestHeaders enumerateKeysAndObjectsUsingBlock: ^(id key, id value, BOOL *stop) {
+            if ([key caseInsensitiveCompare: @"Cookie"] == 0)
+                urlRequest.HTTPShouldHandleCookies = NO;
+            [urlRequest setValue: value forHTTPHeaderField: key];
+        }];
+        
+        if (urlRequest.HTTPShouldHandleCookies) {
+            [self.cookieStorage addCookieHeaderToRequest: urlRequest];
+        }
+
+        // Let the Authorizer add its own headers:
+        [$castIfProtocol(CBLCustomHeadersAuthorizer, _authorizer) authorizeURLRequest: urlRequest];
+
+        _http = [[BLIPHTTPLogic alloc] initWithURLRequest: urlRequest];
+
+        // If no credential yet, get it from authorizer if it has one:
+        if (!_http.credential)
+            _http.credential = $castIfProtocol(CBLCredentialAuthorizer, _authorizer).credential;
+    }
     self.error = nil;
     return NO;
 }
@@ -240,17 +267,17 @@
             error = [NSError errorWithDomain: NSURLErrorDomain
                                         code: NSURLErrorCannotConnectToHost
                                     userInfo: error.userInfo];
+    } else if ($equal(domain, (id)kCFErrorDomainCFNetwork)) {
+        if (code == kCFHostErrorHostNotFound || code == kCFHostErrorUnknown) {
+            error = [NSError errorWithDomain: NSURLErrorDomain
+                                        code: NSURLErrorCannotFindHost
+                                    userInfo: error.userInfo];
+        }
     } else if ($equal(domain, NSURLErrorDomain)) {
         // Map a lower-level auth failure to an HTTP status:
         if (code == NSURLErrorUserAuthenticationRequired)
             error = [NSError errorWithDomain: CBLHTTPErrorDomain
                                         code: kCBLStatusUnauthorized
-                                    userInfo: error.userInfo];
-    } else if ($equal(domain, WebSocketErrorDomain)) {
-        // Map HTTP errors in WebSocket domain to our HTTP domain:
-        if (code >= 300 && code <= 510)
-            error = [NSError errorWithDomain: CBLHTTPErrorDomain
-                                        code: code
                                     userInfo: error.userInfo];
     }
 
@@ -263,7 +290,7 @@
             self, _retryCount, retryDelay, error.localizedDescription);
         [self retryAfterDelay: retryDelay];
     } else {
-        Warn(@"%@: Can't connect, giving up: %@", self, error);
+        Log(@"%@: Can't connect, giving up: %@", self, error);
         self.error = error;
         [self stop];
     }

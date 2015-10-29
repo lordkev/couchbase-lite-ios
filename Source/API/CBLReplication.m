@@ -13,21 +13,32 @@
 //  either express or implied. See the License for the specific language governing permissions
 //  and limitations under the License.
 
-#import "CouchbaseLitePrivate.h"
+#import "CBLInternal.h"
 #import "CBLReplication.h"
 
-#import "CBL_Pusher.h"
+#import "CBL_Replicator.h"
 #import "CBLDatabase+Replication.h"
 #import "CBLDatabase+Internal.h"
 #import "CBLManager+Internal.h"
 #import "CBL_Server.h"
-#import "CBLPersonaAuthorizer.h"
-#import "CBLFacebookAuthorizer.h"
+#import "CBLCookieStorage.h"
+#import "CBLAuthorizer.h"
+#import "CBL_AttachmentTask.h"
+#import "CBLProgressGroup.h"
 #import "MYBlockUtils.h"
 #import "MYURLUtils.h"
 
 
+typedef void (^PendingAction)(id<CBL_Replicator>);
+
+
 NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
+NSString* const kCBLProgressErrorKey = kCBLProgressError;
+
+
+// Declared in CBL_Replicator.h
+NSString* CBL_ReplicatorProgressChangedNotification = @"CBL_ReplicatorProgressChanged";
+NSString* CBL_ReplicatorStoppedNotification = @"CBL_ReplicatorStopped";
 
 
 #define kByChannelFilterName @"sync_gateway/bychannel"
@@ -46,7 +57,12 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
 {
     NSSet* _pendingDocIDs;
     bool _started;
-    CBL_Replicator* _bg_replicator;       // ONLY used on the server thread
+
+    // ONLY used on the server thread:
+    id<CBL_Replicator> _bg_replicator;
+    NSMutableArray* _bg_pendingCookies;
+    NSMutableArray* _bg_pendingActions;
+    NSConditionLock* _bg_stopLock;
 }
 
 
@@ -57,6 +73,7 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
 @synthesize running = _running, completedChangesCount=_completedChangesCount;
 @synthesize changesCount=_changesCount, lastError=_lastError, status=_status;
 @synthesize authenticator=_authenticator, serverCertificate=_serverCertificate;
+@synthesize downloadsAttachments=_downloadsAttachments;
 
 
 - (instancetype) initWithDatabase: (CBLDatabase*)database
@@ -70,6 +87,7 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
         _database = database;
         _remoteURL = remote;
         _pull = pull;
+        _downloadsAttachments = YES;
     }
     return self;
 }
@@ -155,39 +173,9 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
 }
 
 
-#ifdef CBL_DEPRECATED
-
-@synthesize facebookEmailAddress=_facebookEmailAddress;
-
-- (BOOL) registerFacebookToken: (NSString*)token forEmailAddress: (NSString*)email {
-    if (![CBLFacebookAuthorizer registerToken: token forEmailAddress: email forSite: self.remoteURL])
-        return false;
-    self.facebookEmailAddress = email;
-    [self restart];
-    return true;
-}
-#endif
-
-
 - (NSURL*) personaOrigin {
     return self.remoteURL.my_baseURL;
 }
-
-
-#ifdef CBL_DEPRECATED
-@synthesize personaEmailAddress=_personaEmailAddress;
-
-- (BOOL) registerPersonaAssertion: (NSString*)assertion {
-    NSString* email = [CBLPersonaAuthorizer registerAssertion: assertion];
-    if (!email) {
-        Warn(@"Invalid Persona assertion: %@", assertion);
-        return false;
-    }
-    self.personaEmailAddress = email;
-    [self restart];
-    return true;
-}
-#endif
 
 
 - (void) setCookieNamed: (NSString*)name
@@ -209,23 +197,34 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
         Warn(@"%@: Could not create cookie from parameters", self);
         return;
     }
-    [[NSHTTPCookieStorage sharedHTTPCookieStorage] setCookie: cookie];
+
+    [self tellReplicator: ^(id<CBL_Replicator> bgReplicator) {
+        if (bgReplicator)
+            [bgReplicator.cookieStorage setCookie: cookie];
+        else {
+            if (!_bg_pendingCookies)
+                _bg_pendingCookies = [NSMutableArray array];
+            [_bg_pendingCookies addObject: cookie];
+        }
+    }];
 }
 
 
--(void) deleteCookieNamed: (NSString*)name {
-    NSArray* cookies = [[NSHTTPCookieStorage sharedHTTPCookieStorage] cookiesForURL: _remoteURL];
-    for (NSHTTPCookie* cookie in cookies) {
-        if ([cookie.name isEqualToString: name]) {
-            [[NSHTTPCookieStorage sharedHTTPCookieStorage] deleteCookie: cookie];
-            return;
+- (void) deleteCookieNamed: (NSString*)name {
+    [self tellReplicator: ^(id<CBL_Replicator> bgReplicator) {
+        if (_bg_replicator)
+            [_bg_replicator.cookieStorage deleteCookiesNamed: name];
+        else {
+            if (!_bg_pendingCookies)
+                _bg_pendingCookies = [NSMutableArray array];
+            [_bg_pendingCookies addObject: name];
         }
-    }
+    }];
 }
 
 
 + (void) setAnchorCerts: (NSArray*)certs onlyThese: (BOOL)onlyThese {
-    [CBL_Replicator setAnchorCerts: certs onlyThese: onlyThese];
+    CBLSetAnchorCerts(certs, onlyThese);
 }
 
 
@@ -238,18 +237,15 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
                                         {@"create_target", @(_createTarget)},
                                         {@"filter", _filter},
                                         {@"query_params", _filterParams},
-                                        {@"doc_ids", _documentIDs});
+                                        {@"doc_ids", _documentIDs},
+                                        {@"attachments", (_downloadsAttachments ? nil : @NO)});
     NSURL* remoteURL = _remoteURL;
     NSMutableDictionary* authDict = nil;
     if (_authenticator) {
         remoteURL = remoteURL.my_URLByRemovingUser;
-    } else if (_OAuth || _facebookEmailAddress || _personaEmailAddress) {
+    } else if (_OAuth) {
         remoteURL = remoteURL.my_URLByRemovingUser;
         authDict = $mdict({@"oauth", _OAuth});
-        if (_facebookEmailAddress)
-            authDict[@"facebook"] = @{@"email": _facebookEmailAddress};
-        if (_personaEmailAddress)
-            authDict[@"persona"] = @{@"email": _personaEmailAddress};
     }
     NSDictionary* remote = $dict({@"url", remoteURL.absoluteString},
                                  {@"headers", _headers},
@@ -292,25 +288,51 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
 
 
 - (void) stop {
-    [self tellReplicator: ^(CBL_Replicator* bgReplicator) {
-        // This runs on the server thread:
-        [bgReplicator stop];
+    if (!_started)
+        return;
+
+    BOOL stopping = [[self tellReplicatorAndWait: ^id(id<CBL_Replicator> bgReplicator) {
+        if (bgReplicator.status != kCBLReplicatorStopped) {
+            _bg_stopLock = [[NSConditionLock alloc] initWithCondition: 0];
+            [bgReplicator stop];
+            return @(YES);
+        }
+        return @(NO);
+    }] boolValue];
+
+    if (!stopping)
+        return;
+    
+    // Waiting for the background stop notification:
+    NSDate* timeout = [NSDate dateWithTimeIntervalSinceNow: 2.0]; // 2 seconds:
+    if ([_bg_stopLock lockWhenCondition: 1 beforeDate: timeout])
+        [_bg_stopLock unlock];
+    else
+        Warn(@"%@: Timeout waiting for background stop notification", self);
+
+    [self tellReplicatorAndWait: ^id(id<CBL_Replicator> bgReplicator) {
+        _bg_stopLock = nil;
+        return @(YES);
     }];
-    _started = NO;
-    [_database forgetReplication: self];
 }
 
 
 - (void) restart {
     if (_started) {
         [self stop];
-        [self start];
+
+        // Schedule to call the -start method in the next runloop queue or dispatch queue.
+        // This allows the -start method to be called after the _started var is set to 'NO'
+        // in the -updateStatus: method.
+        [_database doAsync:^{
+            [self start];
+        }];
     }
 }
 
 
 - (BOOL) suspended {
-    NSNumber* result = [self tellReplicatorAndWait: ^(CBL_Replicator* bgReplicator) {
+    NSNumber* result = [self tellReplicatorAndWait: ^(id<CBL_Replicator> bgReplicator) {
         return @(bgReplicator.suspended);
     }];
     return result.boolValue;
@@ -318,7 +340,7 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
 
 
 - (void) setSuspended: (BOOL)suspended {
-    [self tellReplicator: ^(CBL_Replicator* bgReplicator) {
+    [self tellReplicator: ^(id<CBL_Replicator> bgReplicator) {
         bgReplicator.suspended = suspended;
     }];
 }
@@ -367,10 +389,12 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
     cfSetObj(&_serverCertificate, serverCert);
 
     if (changed) {
+#ifndef MY_DISABLE_LOGGING
         static const char* kStatusNames[] = {"stopped", "offline", "idle", "active"};
         LogTo(Sync, @"%@: %s, progress = %u / %u, err: %@",
               self, kStatusNames[status], (unsigned)changesProcessed, (unsigned)changesTotal,
               error.localizedDescription);
+#endif
         [[NSNotificationCenter defaultCenter]
                         postNotificationName: kCBLReplicationChangeNotification object: self];
     }
@@ -379,16 +403,41 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
 
 #pragma mark - PUSH REPLICATION ONLY:
 
-
 - (NSSet*) pendingDocumentIDs {
-    if (!_pendingDocIDs && _started && !_pull) {
-        _pendingDocIDs = [self tellReplicatorAndWait: ^(CBL_Replicator* bgReplicator) {
-            CBL_RevisionList* revs = ($castIf(CBL_Pusher, bgReplicator)).unpushedRevisions;
-            return revs ? [NSSet setWithArray: revs.allDocIDs] : nil;
-        }];
-    }
+    if (_pull || (_started && _pendingDocIDs))
+        return _pendingDocIDs;
+
+    _pendingDocIDs = [_database.manager.backgroundServer
+                      waitForDatabaseNamed: _database.name to: ^id(CBLDatabase* bgDb)
+    {
+        CBLStatus status;
+        CBL_ReplicatorSettings* settings =
+            [bgDb.manager replicatorSettingsWithProperties: self.properties
+                                                toDatabase: nil
+                                                    status: &status];
+        if (!settings) {
+            Warn(@"Error parsing replicator settings : %@", CBLStatusToNSError(status));
+            return nil;
+        }
+
+        NSString* lastSequence = _bg_replicator.lastSequence;
+        if (!lastSequence)
+            lastSequence = [bgDb lastSequenceForReplicator: settings];
+
+        NSError* error;
+        CBL_RevisionList* revs = [bgDb unpushedRevisionsSince: lastSequence
+                                                       filter: settings.filterBlock
+                                                       params: settings.filterParameters
+                                                        error: &error];
+        if (revs)
+            return [NSSet setWithArray: revs.allDocIDs];
+        else
+            Warn(@"Error getting unpushed revisions : %@", error);
+        return nil;
+    }];
     return _pendingDocIDs;
 }
+
 
 - (BOOL) isDocumentPending: (CBLDocument*)doc {
     return doc && [self.pendingDocumentIDs containsObject: doc.documentID];
@@ -397,24 +446,70 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
 }
 
 
+#pragma mark - PULL REPLICATION ONLY:
+
+
+- (NSProgress*) downloadAttachment: (CBLAttachment*)attachment{
+    Assert(_pull, @"Not a pull replication");
+    AssertEq(attachment.document.database, _database);
+
+    if (attachment.contentAvailable)
+        return nil;
+
+    NSProgress* progress = [NSProgress progressWithTotalUnitCount: attachment.encodedLength];
+    progress.cancellable = YES;     // downloader will set its own cancellation handler
+    progress.kind = NSProgressKindFile;
+    [progress setUserInfoObject: NSProgressFileOperationKindDownloading
+                         forKey: NSProgressFileOperationKindKey];
+
+    CBL_AttachmentID *attID;
+    attID = [[CBL_AttachmentID alloc] initWithDocID: attachment.document.documentID
+                                              revID: attachment.revision.revisionID
+                                               name: attachment.name
+                                           metadata: attachment.metadata];
+    CBL_AttachmentTask *request = [[CBL_AttachmentTask alloc] initWithID: attID
+                                                                progress: progress];
+
+    [self tellReplicatorWhileRunning:^(id<CBL_Replicator> bgReplicator) {
+        [bgReplicator downloadAttachment: request];
+    }];
+    [self start];
+    return progress;
+}
+
+
 #pragma mark - BACKGROUND OPERATIONS:
 
 
-- (void) tellReplicator: (void (^)(CBL_Replicator*))block {
+- (void) tellReplicator: (void (^)(id<CBL_Replicator>))block {
     [_database.manager.backgroundServer tellDatabaseManager: ^(CBLManager* _) {
         block(_bg_replicator);
     }];
 }
 
-- (id) tellReplicatorAndWait: (id (^)(CBL_Replicator*))block {
+- (id) tellReplicatorAndWait: (id (^)(id<CBL_Replicator>))block {
     return [_database.manager.backgroundServer waitForDatabaseManager: ^(CBLManager* _) {
         return block(_bg_replicator);
     }];
 }
 
+- (void) tellReplicatorWhileRunning: (void (^)(id<CBL_Replicator>))block {
+    [self tellReplicator: ^(id<CBL_Replicator> bgRepl) {
+        if (bgRepl.status > kCBLReplicatorStopped) {
+            // If we have an active replicator, tell it right away:
+            block(bgRepl);
+        } else {
+            // Otherwise, queue the action till the replicator starts:
+            if (!_bg_pendingActions)
+                _bg_pendingActions = [NSMutableArray new];
+            [_bg_pendingActions addObject: block];
+        }
+    }];
+}
+
 
 // CAREFUL: This is called on the server's background thread!
-- (void) bg_setReplicator: (CBL_Replicator*)repl {
+- (void) bg_setReplicator: (id<CBL_Replicator>)repl {
     if (_bg_replicator) {
         [[NSNotificationCenter defaultCenter] removeObserver: self name: nil
                                                       object: _bg_replicator];
@@ -436,21 +531,33 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
 {
     // The setup must use properties, not ivars, because the ivars may change on the main thread.
     CBLStatus status;
-    CBL_Replicator* repl = [server_dbmgr replicatorWithProperties: properties status: &status];
+    id<CBL_Replicator> repl = [server_dbmgr replicatorWithProperties: properties status: &status];
     if (!repl) {
+        __weak CBLReplication *weakSelf = self;
         [_database doAsync: ^{
-            [self updateStatus: kCBLReplicationStopped
-                         error: CBLStatusToNSError(status, nil)
-                     processed: 0 ofTotal: 0 serverCert: NULL];
+            CBLReplication *strongSelf = weakSelf;
+            [strongSelf updateStatus: kCBLReplicationStopped
+                               error: CBLStatusToNSError(status)
+                           processed: 0 ofTotal: 0 serverCert: NULL];
         }];
         return;
     }
     if (auth)
-        repl.authorizer = auth;
+        repl.settings.authorizer = auth;
+
+    if ([_bg_pendingCookies count] > 0) {
+        for (id cookie in _bg_pendingCookies) {
+            if ([cookie isKindOfClass: [NSHTTPCookie class]])
+                [repl.cookieStorage setCookie: cookie];
+            else if ([cookie isKindOfClass: [NSString class]])
+                [repl.cookieStorage deleteCookiesNamed: cookie];
+        }
+        _bg_pendingCookies = nil;
+    }
 
     CBLPropertiesTransformationBlock xformer = self.propertiesTransformationBlock;
     if (xformer) {
-        repl.revisionBodyTransformationBlock = ^(CBL_Revision* rev) {
+        repl.settings.revisionBodyTransformationBlock = ^(CBL_Revision* rev) {
             NSDictionary* properties = rev.properties;
             NSDictionary* xformedProperties = xformer(properties);
             if (xformedProperties == nil) {
@@ -470,41 +577,54 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
     [self bg_setReplicator: repl];
     [repl start];
     [self bg_updateProgress];
+
+    // Perform any pending actions that were queued up by -tellReplicatorWhileRunning:
+    NSArray* actions = _bg_pendingActions;
+    _bg_pendingActions = nil;
+    for (PendingAction action in actions)
+        action(repl);
 }
 
 
 // CAREFUL: This is called on the server's background thread!
-- (void) bg_replicationProgressChanged: (NSNotification*)n
-{
-    AssertEq(n.object, _bg_replicator);
-    [self bg_updateProgress];
+- (void) bg_replicationProgressChanged: (NSNotification*)n {
+    if (n.object == _bg_replicator)
+        [self bg_updateProgress];
+    else
+        Warn(@"%@: Received replication change notification from "
+             "an unexpected replicator %@ (expected %@)", self, n.object, _bg_replicator);
 }
 
 
 // CAREFUL: This is called on the server's background thread!
 - (void) bg_updateProgress {
-    CBLReplicationStatus status;
-    if (!_bg_replicator.running)
-        status = kCBLReplicationStopped;
-    else if (!_bg_replicator.online)
-        status = kCBLReplicationOffline;
-    else
-        status = _bg_replicator.active ? kCBLReplicationActive : kCBLReplicationIdle;
-    
-    // Communicate its state back to the main thread:
+    CBLReplicationStatus status = (CBLReplicationStatus)_bg_replicator.status;
     NSError* error = _bg_replicator.error;
     NSUInteger changes = _bg_replicator.changesProcessed;
     NSUInteger total = _bg_replicator.changesTotal;
     SecCertificateRef serverCert = _bg_replicator.serverCert;
     cfretain(serverCert);
-    [_database doAsync: ^{
-        [self updateStatus: status error: error processed: changes ofTotal: total
-                serverCert: serverCert];
-        cfrelease(serverCert);
-    }];
-    
+
     if (status == kCBLReplicationStopped) {
         [self bg_setReplicator: nil];
+    }
+
+    // Communicate its state back to the main thread:
+    // Call -doAsync: on the manager object instead of on the database object
+    // to allow the block to be executed regardless of the database open status.
+    // Without loosing the database open status check, the stopped notification
+    // can't be sent when the replication is stopped from closing the database.
+    __weak CBLReplication *weakSelf = self;
+    [_database.manager doAsync:^{
+        CBLReplication *strongSelf = weakSelf;
+        [strongSelf updateStatus: status error: error processed: changes ofTotal: total
+                      serverCert: serverCert];
+        cfrelease(serverCert);
+    }];
+
+    if (status == kCBLReplicationStopped) {
+        [_bg_stopLock lockWhenCondition: 0];
+        [_bg_stopLock unlockWithCondition: 1];
     }
 }
 

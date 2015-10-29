@@ -3,12 +3,24 @@
 //  CouchbaseLite
 //
 //  Created by Jens Alfke on 5/1/14.
+//  Copyright (c) 2014-2015 Couchbase, Inc. All rights reserved.
 //
-//
+//  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file
+//  except in compliance with the License. You may obtain a copy of the License at
+//    http://www.apache.org/licenses/LICENSE-2.0
+//  Unless required by applicable law or agreed to in writing, software distributed under the
+//  License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+//  either express or implied. See the License for the specific language governing permissions
+//  and limitations under the License.
 
 #import "CBLForestBridge.h"
+extern "C" {
+#import "ExceptionUtils.h"
+#import "CBLSymmetricKey.h"
+}
 
 using namespace forestdb;
+using namespace couchbase_lite;
 
 
 @implementation CBLForestBridge
@@ -25,14 +37,62 @@ static NSData* dataOfNode(const Revision* rev) {
 }
 
 
++ (void) setEncryptionKey: (fdb_encryption_key*)fdbKey fromSymmetricKey: (CBLSymmetricKey*)key {
+    if (key) {
+        fdbKey->algorithm = FDB_ENCRYPTION_AES256;
+        Assert(key.keyData.length <= sizeof(fdbKey->bytes));
+        memcpy(fdbKey->bytes, key.keyData.bytes, sizeof(fdbKey->bytes));
+    } else {
+        fdbKey->algorithm = FDB_ENCRYPTION_NONE;
+    }
+}
+
+
++ (Database*) openDatabaseAtPath: (NSString*)path
+                      withConfig: (Database::config&)config
+                   encryptionKey: (CBLSymmetricKey*)key
+                           error: (NSError**)outError
+{
+    [self setEncryptionKey: &config.encryption_key fromSymmetricKey: key];
+    __block Database* db = NULL;
+    BOOL ok = tryError(outError, ^{
+        std::string pathStr(path.fileSystemRepresentation);
+        try {
+            db = new Database(pathStr, config);
+        } catch (forestdb::error error) {
+            if (error.status == FDB_RESULT_INVALID_COMPACTION_MODE
+                        && config.compaction_mode == FDB_COMPACTION_AUTO) {
+                // Databases created by earlier builds of CBL (pre-1.2) didn't have auto-compact.
+                // Opening them with auto-compact causes this error. Upgrade such a database by
+                // switching its compaction mode:
+                Log(@"%@: Upgrading to auto-compact", self);
+                config.compaction_mode = FDB_COMPACTION_MANUAL;
+                db = new Database(pathStr, config);
+                db->setCompactionMode(FDB_COMPACTION_AUTO);
+            } else {
+                throw error;
+            }
+        }
+    });
+    return ok ? db : nil;
+}
+
+
 + (CBL_MutableRevision*) revisionObjectFromForestDoc: (VersionedDocument&)doc
                                                revID: (NSString*)revID
-                                             options: (CBLContentOptions)options
+                                            withBody: (BOOL)withBody
 {
     CBL_MutableRevision* rev;
     NSString* docID = (NSString*)doc.docID();
     if (doc.revsAvailable()) {
-        const Revision* revNode = doc.get(revID);
+        const Revision* revNode;
+        if (revID)
+            revNode = doc.get(revID);
+        else {
+            revNode = doc.currentRevision();
+            if (revNode)
+                revID = (NSString*)revNode->revID;
+        }
         if (!revNode)
             return nil;
         rev = [[CBL_MutableRevision alloc] initWithDocID: docID
@@ -46,240 +106,137 @@ static NSData* dataOfNode(const Revision* rev) {
                                                  deleted: doc.isDeleted()];
         rev.sequence = doc.sequence();
     }
-    if (![self loadBodyOfRevisionObject: rev options: options doc: doc])
+    if (withBody && ![self loadBodyOfRevisionObject: rev doc: doc])
         return nil;
-    return rev;
-}
-
-
-+ (CBL_MutableRevision*) revisionObjectFromForestDoc: (VersionedDocument&)doc
-                                            sequence: (forestdb::sequence)sequence
-                                             options: (CBLContentOptions)options
-{
-    const Revision* revNode = doc.getBySequence(sequence);
-    if (!revNode)
-        return nil;
-    CBL_MutableRevision* rev = [[CBL_MutableRevision alloc] initWithDocID: (NSString*)doc.docID()
-                                                                    revID: (NSString*)revNode->revID
-                                                                  deleted: revNode->isDeleted()];
-    if (![self loadBodyOfRevisionObject: rev options: options doc: doc])
-        return nil;
-    rev.sequence = sequence;
     return rev;
 }
 
 
 + (BOOL) loadBodyOfRevisionObject: (CBL_MutableRevision*)rev
-                          options: (CBLContentOptions)options
                               doc: (VersionedDocument&)doc
 {
-    // If caller wants no body and no metadata props, this is a no-op:
-    if (options == kCBLNoBody)
-        return YES;
-
     const Revision* revNode = doc.get(rev.revID);
     if (!revNode)
         return NO;
-    NSData* json = nil;
-    if (!(options & kCBLNoBody)) {
-        json = dataOfNode(revNode);
-        if (!json)
-            return NO;
-    }
-
+    NSData* json = dataOfNode(revNode);
+    if (!json)
+        return NO;
     rev.sequence = revNode->sequence;
-
-    NSMutableDictionary* extra = $mdict();
-    [self addContentProperties: options into: extra rev: revNode];
-    if (json.length > 0)
-        rev.asJSON = [CBLJSON appendDictionary: extra toJSONDictionaryData: json];
-    else
-        rev.properties = extra;
+    rev.asJSON = json;
     return YES;
 }
 
 
-+ (NSDictionary*) bodyOfNode: (const Revision*)rev
-                     options: (CBLContentOptions)options
-{
-    // If caller wants no body and no metadata props, this is a no-op:
-    if (options == kCBLNoBody)
-        return @{};
-
-    NSData* json = nil;
-    if (!(options & kCBLNoBody)) {
-        json = dataOfNode(rev);
-        if (!json)
-            return nil;
-    }
++ (NSMutableDictionary*) bodyOfNode: (const Revision*)rev {
+    NSData* json = dataOfNode(rev);
+    if (!json)
+        return nil;
     NSMutableDictionary* properties = [CBLJSON JSONObjectWithData: json
                                                           options: NSJSONReadingMutableContainers
                                                             error: NULL];
     Assert(properties, @"Unable to parse doc from db: %@", json.my_UTF8ToString);
-    [self addContentProperties: options into: properties rev: rev];
+    NSString* revID = (NSString*)rev->revID;
+    Assert(revID);
+
+    const VersionedDocument* doc = (const VersionedDocument*)rev->owner;
+    properties[@"_id"] = (NSString*)doc->docID();
+    properties[@"_rev"] = revID;
+    if (rev->isDeleted())
+        properties[@"_deleted"] = $true;
     return properties;
 }
 
 
-+ (void) addContentProperties: (CBLContentOptions)options
-                         into: (NSMutableDictionary*)dst
-                         rev: (const Revision*)rev
-{
-    NSString* revID = (NSString*)rev->revID;
-    Assert(revID);
-    const VersionedDocument* doc = (const VersionedDocument*)rev->owner;
-    dst[@"_id"] = (NSString*)doc->docID();
-    dst[@"_rev"] = revID;
-
-    if (rev->isDeleted())
-        dst[@"_deleted"] = $true;
-
-    // Get more optional stuff to put in the properties:
-    if (options & kCBLIncludeLocalSeq)
-        dst[@"_local_seq"] = @(rev->sequence);
-
-    if (options & kCBLIncludeRevs)
-        dst[@"_revisions"] = [self getRevisionHistoryOfNode: rev startingFromAnyOf: nil];
-
-    if (options & kCBLIncludeRevsInfo) {
-        dst[@"_revs_info"] = [self mapHistoryOfNode: rev
-                                            through: ^id(const Revision *rev)
-        {
-            NSString* status = @"available";
-            if (rev->isDeleted())
-                status = @"deleted";
-            else if (!rev->isBodyAvailable())
-                status = @"missing";
-            return $dict({@"rev", (NSString*)rev->revID},
-                         {@"status", status});
-        }];
-    }
-
-    if (options & kCBLIncludeConflicts) {
-        auto revs = doc->currentRevisions();
-        if (revs.size() > 1) {
-            NSMutableArray* conflicts = $marray();
-            for (auto rev = revs.begin(); rev != revs.end(); ++rev) {
-                if (!(*rev)->isDeleted()) {
-                    NSString* revRevID = (NSString*)(*rev)->revID;
-                    if (!$equal(revRevID, revID))
-                        [conflicts addObject: revRevID];
-                }
-            }
-            if (conflicts.count > 0)
-                dst[@"_conflicts"] = conflicts;
-        }
-    }
-
-    if (!options & kCBLIncludeAttachments)
-        [dst removeObjectForKey: @"_attachments"];
-}
-
-
-+ (NSArray*) getCurrentRevisionIDs: (VersionedDocument&)doc {
++ (NSArray*) getCurrentRevisionIDs: (VersionedDocument&)doc includeDeleted: (BOOL)includeDeleted {
     NSMutableArray* currentRevIDs = $marray();
     auto revs = doc.currentRevisions();
     for (auto rev = revs.begin(); rev != revs.end(); ++rev)
-        if (!(*rev)->isDeleted())
+        if (includeDeleted || !(*rev)->isDeleted())
             [currentRevIDs addObject: (NSString*)(*rev)->revID];
     return currentRevIDs;
 }
 
 
 + (NSArray*) mapHistoryOfNode: (const Revision*)rev
-                      through: (id(^)(const Revision*))block
+                      through: (id(^)(const Revision*, BOOL *stop))block
 {
     NSMutableArray* history = $marray();
-    for (; rev; rev = rev->parent())
-        [history addObject: block(rev)];
+    BOOL stop = NO;
+    for (; rev && !stop; rev = rev->parent())
+        [history addObject: block(rev, &stop)];
     return history;
 }
 
 
-+ (NSArray*) getRevisionHistory: (const Revision*)revNode
++ (NSArray*) getRevisionHistoryOfNode: (const forestdb::Revision*)revNode
+                         backToRevIDs: (NSSet*)ancestorRevIDs
 {
     const VersionedDocument* doc = (const VersionedDocument*)revNode->owner;
     NSString* docID = (NSString*)doc->docID();
     return [self mapHistoryOfNode: revNode
-                          through: ^id(const Revision *ancestor)
+                          through: ^id(const Revision *ancestor, BOOL *stop)
     {
         CBL_MutableRevision* rev = [[CBL_MutableRevision alloc] initWithDocID: docID
                                                                 revID: (NSString*)ancestor->revID
                                                               deleted: ancestor->isDeleted()];
         rev.missing = !ancestor->isBodyAvailable();
+        if ([ancestorRevIDs containsObject: rev.revID])
+            *stop = YES;
         return rev;
     }];
 }
 
 
-+ (NSDictionary*) getRevisionHistoryOfNode: (const Revision*)rev
-                         startingFromAnyOf: (NSArray*)ancestorRevIDs
-{
-    NSArray* history = [self getRevisionHistory: rev]; // (this is in reverse order, newest..oldest
-    if (ancestorRevIDs.count > 0) {
-        NSUInteger n = history.count;
-        for (NSUInteger i = 0; i < n; ++i) {
-            if ([ancestorRevIDs containsObject: [history[i] revID]]) {
-                history = [history subarrayWithRange: NSMakeRange(0, i+1)];
-                break;
-            }
-        }
-    }
-    return [self makeRevisionHistoryDict: history];
-}
-
-
-+ (NSDictionary*) makeRevisionHistoryDict: (NSArray*)history {
-    if (!history)
-        return nil;
-
-    // Try to extract descending numeric prefixes:
-    NSMutableArray* suffixes = $marray();
-    id start = nil;
-    int lastRevNo = -1;
-    for (CBL_Revision* rev in history) {
-        int revNo;
-        NSString* suffix;
-        if ([CBL_Revision parseRevID: rev.revID intoGeneration: &revNo andSuffix: &suffix]) {
-            if (!start)
-                start = @(revNo);
-            else if (revNo != lastRevNo - 1) {
-                start = nil;
-                break;
-            }
-            lastRevNo = revNo;
-            [suffixes addObject: suffix];
-        } else {
-            start = nil;
-            break;
-        }
-    }
-
-    NSArray* revIDs = start ? suffixes : [history my_map: ^(id rev) {return [rev revID];}];
-    return $dict({@"ids", revIDs}, {@"start", start});
-}
-    
-
 @end
 
 
+namespace couchbase_lite {
 
-CBLStatus CBLStatusFromForestDBStatus(int fdbStatus) {
-    switch (fdbStatus) {
-        case FDB_RESULT_SUCCESS:
-            return kCBLStatusOK;
-        case FDB_RESULT_KEY_NOT_FOUND:
-        case FDB_RESULT_NO_SUCH_FILE:
-            return kCBLStatusNotFound;
-        case FDB_RESULT_RONLY_VIOLATION:
-            return kCBLStatusForbidden;
-        case FDB_RESULT_CHECKSUM_ERROR:
-        case FDB_RESULT_FILE_CORRUPTION:
-        case error::CorruptRevisionData:
-            return kCBLStatusCorruptError;
-        case error::BadRevisionID:
-            return kCBLStatusBadID;
-        default:
-            return kCBLStatusDBError;
+    CBLStatus tryStatus(CBLStatus(^block)()) {
+        try {
+            return block();
+        } catch (forestdb::error err) {
+            return CBLStatusFromForestDBStatus(err.status);
+        } catch (NSException* x) {
+            MYReportException(x, @"CBL_ForestDBStorage");
+            return kCBLStatusException;
+        } catch (...) {
+            Warn(@"Unknown C++ exception caught in CBL_ForestDBStorage");
+            return kCBLStatusException;
+        }
     }
+
+
+    bool tryError(NSError** outError, void(^block)()) {
+        CBLStatus status = tryStatus(^{
+            block();
+            return kCBLStatusOK;
+        });
+        return CBLStatusToOutNSError(status, outError);
+    }
+
+
+    CBLStatus CBLStatusFromForestDBStatus(int fdbStatus) {
+        switch (fdbStatus) {
+            case FDB_RESULT_SUCCESS:
+                return kCBLStatusOK;
+            case FDB_RESULT_KEY_NOT_FOUND:
+            case FDB_RESULT_NO_SUCH_FILE:
+                return kCBLStatusNotFound;
+            case FDB_RESULT_RONLY_VIOLATION:
+                return kCBLStatusForbidden;
+            case FDB_RESULT_NO_DB_HEADERS:
+            case FDB_RESULT_CRYPTO_ERROR:
+                return kCBLStatusUnauthorized;     // assuming db is encrypted
+            case FDB_RESULT_CHECKSUM_ERROR:
+            case FDB_RESULT_FILE_CORRUPTION:
+            case error::CorruptRevisionData:
+                return kCBLStatusCorruptError;
+            case error::BadRevisionID:
+                return kCBLStatusBadID;
+            default:
+                return kCBLStatusDBError;
+        }
+    }
+
 }

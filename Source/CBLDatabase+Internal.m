@@ -23,11 +23,11 @@
 #import "CBL_Revision.h"
 #import "CBLDatabaseChange.h"
 #import "CBL_BlobStore.h"
-#import "CBL_Puller.h"
-#import "CBL_Pusher.h"
+#import "CBL_Replicator.h"
 #import "CBL_Shared.h"
 #import "CBLMisc.h"
 #import "CBLDatabase.h"
+#import "CBLDatabaseUpgrade.h"
 #import "CouchbaseLitePrivate.h"
 
 #import "MYBlockUtils.h"
@@ -41,15 +41,15 @@ NSString* const CBL_DatabaseWillBeDeletedNotification = @"CBL_DatabaseWillBeDele
 NSString* const CBL_PrivateRunloopMode = @"CouchbaseLitePrivate";
 NSArray* CBL_RunloopModes;
 
-const CBLChangesOptions kDefaultCBLChangesOptions = {UINT_MAX, 0, NO, NO, YES};
+const CBLChangesOptions kDefaultCBLChangesOptions = {UINT_MAX, NO, NO, YES, NO};
+
+// When this many changes pile up in _changesToNotify, start removing their bodies to save RAM
+#define kManyChangesToNotify 5000
 
 static BOOL sAutoCompact = YES;
 
 
 @implementation CBLDatabase (Internal)
-
-#define kLocalCheckpointDocId @"CBL_LocalCheckpoint"
-
 
 + (void) initialize {
     if (self == [CBLDatabase class]) {
@@ -94,7 +94,6 @@ static BOOL sAutoCompact = YES;
 
 #if DEBUG
 + (instancetype) createEmptyDBAtPath: (NSString*)dir {
-    [self setAutoCompact: NO]; // unit tests don't want autocompact
     if (![self deleteDatabaseFilesAtPath: dir error: NULL])
         return nil;
     CBLDatabase *db = [[self alloc] initWithDir: dir name: nil manager: nil readOnly: NO];
@@ -156,28 +155,49 @@ static BOOL sAutoCompact = YES;
     NSString* storageType = _manager.storageType ?: @"SQLite";
     NSString* storageClassName = $sprintf(@"CBL_%@Storage", storageType);
     Class primaryStorage = NSClassFromString(storageClassName);
-    Assert(primaryStorage, @"CBLManager.storageType is '%@' but no %@ class found",
+    Assert(primaryStorage, @"CBLManager.storageType is '%@' but no %@ class found, maybe add the -ObjC flag to Other Linker Flags in Build Settings",
            _manager.storageType, storageClassName);
     Assert([primaryStorage conformsToProtocol: @protocol(CBL_Storage)],
             @"CBLManager.storageType is '%@' but %@ is not a CBL_Storage implementation",
             _manager.storageType, storageClassName);
+
+    id<CBL_Storage> storage;
+    BOOL upgrade = NO;
+
+    if (_manager.upgradeStorage) {
+        // If upgrading, always use primary storage type, and check for SQL db:
+        storage = [[primaryStorage alloc] init];
+        if (![storageType isEqualToString: @"SQLite"]) {
+            NSString* sqlitePath = [_dir stringByAppendingPathComponent: @"db.sqlite3"];
+            upgrade = [[NSFileManager defaultManager] fileExistsAtPath: sqlitePath]
+                        && ![storage databaseExistsIn: _dir];
+        }
+    } else {
+        // Use primary unless dir already contains a db created by secondary:
     Class secondaryStorage = NSClassFromString(@"CBL_ForestDBStorage");
     if (primaryStorage == secondaryStorage)
         secondaryStorage = NSClassFromString(@"CBL_SQLiteStorage");
-    // Use primary unless dir already contains a db created by secondary:
-    id<CBL_Storage> storage = [[secondaryStorage alloc] init];
-    if (![storage databaseExistsIn: _dir])
+        storage = [[secondaryStorage alloc] init];
+        if (!storage || ![storage databaseExistsIn: _dir])
         storage = [[primaryStorage alloc] init];
+    }
+
     LogTo(CBLDatabase, @"Using %@ for db at %@", [storage class], _dir);
 
     _storage = storage;
     _storage.delegate = self;
+    _storage.autoCompact = sAutoCompact;
+
+    CBLSymmetricKey* encryptionKey = [_manager.shared valueForType: @"encryptionKey"
+                                                              name: @"" inDatabaseNamed: _name];
+    if ([_storage respondsToSelector: @selector(setEncryptionKey:)])
+        [_storage setEncryptionKey: encryptionKey];
+
     if (![_storage openInDirectory: _dir
                           readOnly: _readOnly
                            manager: _manager
                              error: outError])
         return NO;
-    _storage.autoCompact = sAutoCompact;
 
     // First-time setup:
     if (!self.privateUUID) {
@@ -185,9 +205,13 @@ static BOOL sAutoCompact = YES;
         [_storage setInfo: CBLCreateUUID() forKey: @"publicUUID"];
     }
 
+    _storage.maxRevTreeDepth = [[_storage infoForKey: @"max_revs"] intValue] ?: kDefaultMaxRevs;
+
     // Open attachment store:
     NSString* attachmentsPath = self.attachmentStorePath;
-    _attachments = [[CBL_BlobStore alloc] initWithPath: attachmentsPath error: outError];
+    _attachments = [[CBL_BlobStore alloc] initWithPath: attachmentsPath
+                                         encryptionKey: encryptionKey
+                                                 error: outError];
     if (!_attachments) {
         Warn(@"%@: Couldn't open attachment store at %@", self, attachmentsPath);
         [_storage close];
@@ -195,7 +219,9 @@ static BOOL sAutoCompact = YES;
         return NO;
     }
 
+    [self willChangeValueForKey: @"isOpen"];
     _isOpen = YES;
+    [self didChangeValueForKey: @"isOpen"];
 
     // Listen for _any_ CBLDatabase changing, so I can detect changes made to my database
     // file by other instances (running on other threads presumably.)
@@ -207,6 +233,29 @@ static BOOL sAutoCompact = YES;
                                              selector: @selector(dbChanged:)
                                                  name: CBL_DatabaseWillBeDeletedNotification
                                                object: nil];
+
+    if (upgrade) {
+        // Upgrading a SQLite database:
+        Class databaseUpgradeClass = NSClassFromString(@"CBLDatabaseUpgrade");
+        if (databaseUpgradeClass) {
+            NSString* dbPath = [_dir stringByAppendingPathComponent: @"db.sqlite3"];
+            Log(@"%@: Upgrading to %@ ...", self, storageType);
+            CBLDatabaseUpgrade* upgrader = [[databaseUpgradeClass alloc] initWithDatabase: self
+                                                                               sqliteFile: dbPath];
+            CBLStatus status = [upgrader import];
+            if (CBLStatusIsError(status)) {
+                Warn(@"Upgrade failed: status %d", status);
+                [upgrader backOut];
+                [self _close];
+                return CBLStatusToOutNSError(status, outError);
+            } else {
+                [upgrader deleteSQLiteFiles];
+            }
+        } else {
+            Warn(@"Upgrade skipped: Database upgrading class is not present.");
+        }
+    }
+
     return YES;
 }
 
@@ -231,15 +280,18 @@ static BOOL sAutoCompact = YES;
             [view close];
         
         _views = nil;
-        for (CBL_Replicator* repl in _activeReplicators.copy)
+        for (id<CBL_Replicator> repl in _activeReplicators.copy)
             [repl databaseClosing];
         
         _activeReplicators = nil;
 
         [_storage close];
         _storage = nil;
+        _attachments = nil;
 
+        [self willChangeValueForKey: @"isOpen"];
         _isOpen = NO;
+        [self didChangeValueForKey: @"isOpen"];
 
         [[NSNotificationCenter defaultCenter] removeObserver: self];
         [self _clearDocumentCache];
@@ -281,6 +333,16 @@ static BOOL sAutoCompact = YES;
         // But the CBLDocument, if any, needs to know right away so it can update its
         // currentRevision.
         [[self _cachedDocumentWithID: change.documentID] revisionAdded: change notify: NO];
+    }
+
+    // Squish the change objects if too many of them are piling up:
+    if (_changesToNotify.count >= kManyChangesToNotify) {
+        if (_changesToNotify.count == kManyChangesToNotify) {
+            for (CBLDatabaseChange* c in _changesToNotify)
+                [c reduceMemoryUsage];
+        } else {
+            [change reduceMemoryUsage];
+        }
     }
 }
 
@@ -376,14 +438,11 @@ static BOOL sAutoCompact = YES;
 
 - (CBL_Revision*) getDocumentWithID: (NSString*)docID
                          revisionID: (NSString*)inRevID
-                            options: (CBLContentOptions)options
+                           withBody: (BOOL)withBody
                              status: (CBLStatus*)outStatus
 {
-    CBL_MutableRevision* rev = [_storage getDocumentWithID: docID revisionID: inRevID
-                                            options: options status: outStatus];
-    if (rev && (options & kCBLIncludeAttachments))
-        [self expandAttachmentsIn: rev options: options];
-    return rev;
+    return [_storage getDocumentWithID: docID revisionID: inRevID
+                              withBody: withBody status: outStatus];
 }
 
 
@@ -392,42 +451,37 @@ static BOOL sAutoCompact = YES;
                          revisionID: (NSString*)revID
 {
     CBLStatus status;
-    return [self getDocumentWithID: docID revisionID: revID options: 0 status: &status];
+    return [self getDocumentWithID: docID revisionID: revID withBody: YES status: &status];
 }
 #endif
 
 
-- (CBLStatus) loadRevisionBody: (CBL_MutableRevision*)rev
-                       options: (CBLContentOptions)options
-{
+- (CBLStatus) loadRevisionBody: (CBL_MutableRevision*)rev {
     // First check for no-op -- if we just need the default properties and already have them:
-    if (options==0 && rev.sequenceIfKnown) {
+    if (rev.sequenceIfKnown) {
         NSDictionary* props = rev.properties;
         if (props.cbl_rev && props.cbl_id)
             return kCBLStatusOK;
     }
     Assert(rev.docID && rev.revID);
 
-    CBLStatus status = [_storage loadRevisionBody: rev options: options];
-
-    if (status == kCBLStatusOK)
-        if (options & kCBLIncludeAttachments)
-            [self expandAttachmentsIn: rev options: options];
-    return status;
+    return [_storage loadRevisionBody: rev];
 }
 
 - (CBL_Revision*) revisionByLoadingBody: (CBL_Revision*)rev
-                                options: (CBLContentOptions)options
                                  status: (CBLStatus*)outStatus
 {
     // First check for no-op -- if we just need the default properties and already have them:
-    if (options==0 && rev.sequenceIfKnown) {
+    if (rev.sequenceIfKnown) {
         NSDictionary* props = rev.properties;
-        if (props.cbl_rev && props.cbl_id)
+        if (props.cbl_rev && props.cbl_id) {
+            if (outStatus)
+                *outStatus = kCBLStatusOK;
             return rev;
+        }
     }
     CBL_MutableRevision* nuRev = rev.mutableCopy;
-    CBLStatus status = [self loadRevisionBody: nuRev options: options];
+    CBLStatus status = [self loadRevisionBody: nuRev];
     if (outStatus)
         *outStatus = status;
     if (CBLStatusIsError(status))
@@ -463,6 +517,64 @@ static BOOL sAutoCompact = YES;
                                    filter: revFilter status: outStatus];
 }
 
+
+// Used by new replicator
+- (NSArray*) getPossibleAncestorsOfDocID: (NSString*)docID
+                                   revID: (NSString*)revID
+                                   limit: (NSUInteger)limit
+{
+    CBL_Revision* rev = [[CBL_Revision alloc] initWithDocID: docID revID: revID deleted: NO];
+    if ([_storage getRevisionSequence: rev] > 0)
+        return @[revID];  // Already have it!
+    return [_storage getPossibleAncestorRevisionIDs: rev
+                                              limit: (unsigned)limit
+                                    onlyAttachments: NO];
+}
+
+
+#pragma mark - HISTORY:
+
+
+- (NSArray*) getRevisionHistory: (CBL_Revision*)rev
+                   backToRevIDs: (NSArray*)ancestorRevIDs
+{
+    NSSet* ancestors = ancestorRevIDs ? [[NSSet alloc] initWithArray: ancestorRevIDs] : nil;
+    return [_storage getRevisionHistory: rev backToRevIDs: ancestors];
+}
+
+/** Turns an array of CBL_Revisions into a _revisions dictionary, as returned by the REST API's 
+    ?revs=true option. */
++ (NSDictionary*) makeRevisionHistoryDict: (NSArray*)history {
+    if (!history)
+        return nil;
+
+    // Try to extract descending numeric prefixes:
+    NSMutableArray* suffixes = $marray();
+    id start = nil;
+    int lastRevNo = -1;
+    for (CBL_Revision* rev in history) {
+        int revNo;
+        NSString* suffix;
+        if ([CBL_Revision parseRevID: rev.revID intoGeneration: &revNo andSuffix: &suffix]) {
+            if (!start)
+                start = @(revNo);
+            else if (revNo != lastRevNo - 1) {
+                start = nil;
+                break;
+            }
+            lastRevNo = revNo;
+            [suffixes addObject: suffix];
+        } else {
+            start = nil;
+            break;
+        }
+    }
+
+    NSArray* revIDs = start ? suffixes : [history my_map: ^(id rev) {return [rev revID];}];
+    return $dict({@"ids", revIDs}, {@"start", start});
+}
+
+
 #pragma mark - FILTERS:
 
 
@@ -492,7 +604,7 @@ static BOOL sAutoCompact = YES;
     CBLStatus status;
     CBL_Revision* rev = [self getDocumentWithID: [@"_design/" stringByAppendingString: path[0]]
                                     revisionID: nil
-                                        options: 0
+                                       withBody: YES
                                          status: &status];
     if (!rev)
         return nil;
@@ -556,10 +668,74 @@ static BOOL sAutoCompact = YES;
 }
 
 
+static SequenceNumber keyToSequence(id key, SequenceNumber dflt) {
+    return [key isKindOfClass: [NSNumber class]]? [key longLongValue] : dflt;
+}
+
+
 - (CBLQueryIteratorBlock) getAllDocs: (CBLQueryOptions*)options
                               status: (CBLStatus*)outStatus
 {
-    return [_storage getAllDocs: options status: outStatus];
+    // For regular all-docs, let storage do it all:
+    if (!options || options->allDocsMode != kCBLBySequence)
+        return [_storage getAllDocs: options status: outStatus];
+
+    // For changes feed mode (kCBLBySequence) do more work here:
+    if (options->descending) {
+        *outStatus = kCBLStatusNotImplemented;    //FIX: Implement descending order
+        return nil;
+    }
+    CBLChangesOptions changesOpts = {
+        .limit = options->limit,
+        .includeDocs = options->includeDocs,
+        .includeConflicts = YES,
+        .sortBySequence = YES
+    };
+    SequenceNumber startSeq = keyToSequence(options.startKey, 1);
+    SequenceNumber endSeq = keyToSequence(options.endKey, INT64_MAX);
+    if (!options->inclusiveStart)
+        ++startSeq;
+    if (!options->inclusiveEnd)
+        --endSeq;
+    SequenceNumber minSeq = startSeq, maxSeq = endSeq;
+    if (minSeq > maxSeq) {
+        *outStatus = kCBLStatusOK;
+        return nil;  // empty result
+    }
+    CBL_RevisionList* revs = [_storage changesSinceSequence: minSeq - 1
+                                                    options: &changesOpts
+                                                     filter: nil
+                                                     status: outStatus];
+    if (!revs)
+        return nil;
+
+    NSEnumerator* revEnum = (options->descending) ? revs.allRevisions.reverseObjectEnumerator
+                                                  : revs.allRevisions.objectEnumerator;
+    return ^CBLQueryRow*() {
+        for (;;) {
+            CBL_Revision* rev = revEnum.nextObject;
+            if (!rev)
+                return nil;
+            SequenceNumber seq = rev.sequence;
+            if (seq < minSeq || seq > maxSeq)
+                return nil;
+            NSDictionary* value = $dict({@"rev", rev.revID},
+                                        {@"deleted", (rev.deleted ?$true : nil)});
+            CBLQueryRow* row =  [[CBLQueryRow alloc] initWithDocID: rev.docID
+                                                          sequence: seq
+                                                               key: rev.docID
+                                                             value: value
+                                                       docRevision: rev
+                                                           storage: nil];
+            if (!options.filter)
+                return row;
+            row.database = self;
+            if (options.filter(row)) {
+                //row.database = nil;
+                return row;
+            }
+        }
+    };
 }
 
 
@@ -567,19 +743,6 @@ static BOOL sAutoCompact = YES;
     [self doAsync:^{
         [[NSNotificationCenter defaultCenter] postNotification: notification];
     }];
-}
-
-
-    - (BOOL) createLocalCheckpointDocument: (NSError**)outError {
-    NSDictionary* document = @{ kCBLDatabaseLocalCheckpoint_LocalUUID : self.privateUUID };
-    BOOL result = [self putLocalDocument: document withID: kLocalCheckpointDocId error: outError];
-    if (!result)
-        Warn(@"CBLDatabase: Could not create a local checkpoint document with an error: %@", *outError);
-    return result;
-}
-
-- (NSDictionary*) getLocalCheckpointDocument {
-    return [self existingLocalDocumentWithID:kLocalCheckpointDocId];
 }
 
 

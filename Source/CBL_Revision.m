@@ -86,6 +86,16 @@
     return rev;
 }
 
+- (CBL_Revision*) copyWithoutBody {
+    if (!_body && self.class == [CBL_Revision class])
+        return self;
+    CBL_Revision* rev = [[CBL_Revision alloc] initWithDocID: _docID revID: _revID
+                                                    deleted: _deleted];
+    rev->_sequence = _sequence;
+    rev->_missing = _missing;
+    return rev;
+}
+
 @synthesize docID=_docID, revID=_revID, deleted=_deleted, missing=_missing, body=_body;
 
 - (SequenceNumber) sequenceIfKnown {
@@ -172,6 +182,11 @@
     return CBLSequenceCompare(_sequence, rev->_sequence);
 }
 
+- (NSComparisonResult) compareSequencesDescending: (CBL_Revision*)rev {
+    NSParameterAssert(rev != nil);
+    return CBLSequenceCompare(_sequence, rev->_sequence) * -1;
+}
+
 - (CBL_MutableRevision*) mutableCopyWithDocID: (UU NSString*)docID revID: (UU NSString*)revID {
     CBL_MutableRevision* rev = [self mutableCopy];
     [rev setDocID: docID revID: revID];
@@ -197,39 +212,47 @@
 /** Returns the JSON to be stored into the database.
     This has all the special keys like "_id" stripped out, and keys in canonical order. */
 + (NSData*) asCanonicalJSON: (UU NSDictionary*)properties error: (NSError**)outError {
-    static NSSet* sSpecialKeysToRemove, *sSpecialKeysToLeave;
+    // Initialize the key filter that will strip out top level "_"-prefixed keys:
+    static CBJSONEncoderKeyFilter sKeyFilter;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        sSpecialKeysToRemove = [[NSSet alloc] initWithObjects: @"_id", @"_rev",
-                                @"_deleted", @"_revisions", @"_revs_info", @"_conflicts", @"_deleted_conflicts",
-                                @"_local_seq", nil];
-        sSpecialKeysToLeave = [[NSSet alloc] initWithObjects:
+        NSSet* specialKeysToRemove, *specialKeysToLeave;
+        specialKeysToRemove = [[NSSet alloc] initWithObjects: @"_id", @"_rev",
+                                       @"_deleted", @"_revisions", @"_revs_info", @"_conflicts",
+                                       @"_deleted_conflicts", @"_local_seq", nil];
+        specialKeysToLeave = [[NSSet alloc] initWithObjects:
                                @"_attachments", @"_removed", nil];
+        sKeyFilter = ^BOOL(NSString* key, NSError** outError) {
+            if (![key hasPrefix: @"_"]) {
+                return YES;
+            } else if ([specialKeysToRemove member: key]) {
+                return NO;
+            } else if ([specialKeysToLeave member: key]) {
+                return YES;
+            } else {
+                Log(@"CBLDatabase: Invalid top-level key '%@' in document to be inserted", key);
+                return CBLStatusToOutNSError(kCBLStatusBadJSON, outError);
+            }
+        };
     });
 
-    if (!properties)
+    if (!properties) {
+        CBLStatusToOutNSError(kCBLStatusBadJSON, outError);
         return nil;
-
-    // Don't leave in any "_"-prefixed keys except for the ones in sSpecialKeysToLeave.
-    // Keys in sSpecialKeysToRemove (_id, _rev, ...) are left out, any others trigger an error.
-    NSMutableDictionary* editedProperties = nil;
-    for (NSString* key in properties) {
-        if ([key hasPrefix: @"_"]  && ![sSpecialKeysToLeave member: key]) {
-            if (![sSpecialKeysToRemove member: key]) {
-                Log(@"CBLDatabase: Invalid top-level key '%@' in document to be inserted", key);
-                return nil;
-            }
-            if (!editedProperties)
-                editedProperties = [properties mutableCopy];
-            [editedProperties removeObjectForKey: key];
-        }
     }
 
     // Create canonical JSON -- this is important, because the JSON data returned here will be used
     // to create the new revision ID, and we need to guarantee that equivalent revision bodies
     // result in equal revision IDs.
-    return [CBJSONEncoder canonicalEncoding: (editedProperties ?: properties)
-                                      error: outError];
+    CBJSONEncoder* encoder = [[CBJSONEncoder alloc] init];
+    encoder.canonical = YES;
+    encoder.keyFilter = sKeyFilter;
+    if (![encoder encode: properties]) {
+        if (outError)
+            *outError = encoder.error;
+        return nil;
+    }
+    return encoder.encodedData;
 }
 
 
@@ -268,11 +291,12 @@
 }
 
 - (void) setProperties:(UU NSDictionary *)properties {
-    self.body = [[CBL_Body alloc] initWithProperties: properties];
+    _body = [[CBL_Body alloc] initWithProperties: properties];
 }
 
 - (void) setAsJSON:(UU NSData *)asJSON {
-    self.body = [[CBL_Body alloc] initWithJSON: asJSON];
+    _body = [[CBL_Body alloc] initWithJSON: asJSON
+                               addingDocID: _docID revID: _revID deleted: _deleted];
 }
 
 - (void) setObject: (UU id)object forKeyedSubscript: (UU NSString*)key {
@@ -290,6 +314,7 @@
 }
 
 - (id) copyWithZone: (NSZone*)zone {
+    // Overridden because CBL_Revision just returns `self` instead of making a copy
     CBL_Revision* rev = [[CBL_Revision alloc] initWithDocID: _docID revID: _revID deleted: _deleted];
     rev->_body = _body;
     rev->_sequence = _sequence;
@@ -358,6 +383,10 @@
     return self;
 }
 
+- (instancetype) mutableCopyWithZone: (NSZone*)zoneIgnored {
+    return [[[self class] alloc] initWithArray: _revs];
+}
+
 
 - (NSString*) description {
     return _revs.description;
@@ -379,6 +408,10 @@
 
 - (void) removeRev: (CBL_Revision*)rev {
     [_revs removeObject: rev];
+}
+
+- (void) removeRevIdenticalTo: (CBL_Revision*)rev {
+    [_revs removeObjectIdenticalTo: rev];
 }
 
 - (CBL_Revision*) removeAndReturnRev: (CBL_Revision*)rev {
@@ -434,8 +467,11 @@
         [_revs removeObjectsInRange: NSMakeRange(limit, _revs.count - limit)];
 }
 
-- (void) sortBySequence {
-    [_revs sortUsingSelector: @selector(compareSequences:)];
+- (void) sortBySequenceAscending:(BOOL)ascending {
+    if (ascending)
+        [_revs sortUsingSelector: @selector(compareSequences:)];
+    else
+        [_revs sortUsingSelector: @selector(compareSequencesDescending:)];
 }
 
 - (void) sortByDocID {

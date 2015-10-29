@@ -6,18 +6,12 @@
 //  Copyright (c) 2012-2013 Couchbase, Inc. All rights reserved.
 //
 
-#import <Foundation/Foundation.h>
+#import "CBLBase.h"
 #import "CBLView.h"
 @class CBLManager, CBLDocument, CBLRevision, CBLSavedRevision, CBLView, CBLQuery, CBLReplication;
 @protocol CBLValidationContext;
 
-#if __has_feature(nullability) // Xcode 6.3+
-#pragma clang assume_nonnull begin
-#else
-#define nullable
-#define __nullable
-#endif
-
+NS_ASSUME_NONNULL_BEGIN
 
 /** Validation block, used to approve revisions being added to the database.
     The block should call `[context reject]` or `[context rejectWithMessage:]` if the proposed
@@ -29,7 +23,7 @@ typedef void (^CBLValidationBlock) (CBLRevision* newRevision,
                                     {BLOCK}
 
 /** Filter block, used in changes feeds and replication. */
-typedef BOOL (^CBLFilterBlock) (CBLSavedRevision* revision, __nullable NSDictionary* params);
+typedef BOOL (^CBLFilterBlock) (CBLSavedRevision* revision, NSDictionary* __nullable  params);
 
 #define FILTERBLOCK(BLOCK) ^BOOL(CBLSavedRevision* revision, NSDictionary* params) {BLOCK}
 
@@ -70,11 +64,11 @@ typedef BOOL (^CBLFilterBlock) (CBLSavedRevision* revision, __nullable NSDiction
 /** Closes a database.
     This first stops all replications, and calls -saveAllModels: to save changes to CBLModel
     objects. It returns NO if some models failed to save. */
-- (BOOL) close: (__nullable NSError**)error;
+- (BOOL) close: (NSError**)error;
 
 /** Compacts the database file by purging non-current JSON bodies, pruning revisions older than
     the maxRevTreeDepth, deleting unused attachment files, and vacuuming the SQLite database. */
-- (BOOL) compact: (__nullable NSError**)outError;
+- (BOOL) compact: (NSError**)outError;
 
 /** The maximum depth of a document's revision tree (or, max length of its revision history.)
     Revisions older than this limit will be deleted during a -compact: operation. 
@@ -82,15 +76,28 @@ typedef BOOL (^CBLFilterBlock) (CBLSavedRevision* revision, __nullable NSDiction
 @property NSUInteger maxRevTreeDepth;
 
 /** Deletes the database. */
-- (BOOL) deleteDatabase: (__nullable NSError**)outError;
+- (BOOL) deleteDatabase: (NSError**)outError;
 
 /** Changes the database's unique IDs to new random values.
     Ordinarily you should never need to call this method; it's only made public to fix databases
     that are already affected by bug github.com/couchbase/couchbase-lite-ios/issues/145 .
     Make sure you only call this once, to fix that problem, because every call has the side effect
     of resetting all replications, making them run slow the next time. */
-- (BOOL) replaceUUIDs: (__nullable NSError**)outError;
+- (BOOL) replaceUUIDs: (NSError**)outError;
 
+/** Changes the database's encryption key, or removes encryption if the new key is nil.
+
+    To use this API, the database storage engine must support encryption. In the case of SQLite,
+    this means the application must be linked with SQLCipher <http://sqlcipher.net> instead of
+    regular SQLite. Otherwise opening the database will fail with an error.
+    @param keyOrPassword  The encryption key in the form of an NSString (a password) or an
+                NSData object exactly 32 bytes in length (a raw AES key.) If a string is given,
+                it will be internally converted to a raw key using 64,000 rounds of PBKDF2 hashing.
+                A nil value will decrypt the database.
+    @param error  If an error occurs, it will be stored here if this parameter is non-NULL.
+    @result  YES if the database was successfully re-keyed, or NO on error. */
+- (BOOL) changeEncryptionKey: (nullable id)keyOrPassword
+                       error: (NSError**)error;
 
 #pragma mark - DOCUMENT ACCESS:
 
@@ -108,7 +115,7 @@ typedef BOOL (^CBLFilterBlock) (CBLSavedRevision* revision, __nullable NSDiction
 - (nullable CBLDocument*) existingDocumentWithID: (NSString*)docID;
 
 /** Same as -documentWithID:. Enables "[]" access in Xcode 4.4+ */
-- (CBLDocument*)objectForKeyedSubscript: (NSString*)key;
+- (nullable CBLDocument*)objectForKeyedSubscript: (NSString*)key;
 
 /** Creates a new CBLDocument object with no properties and a new (random) UUID.
     The document will be saved to the database when you call -putProperties: on it. */
@@ -119,18 +126,18 @@ typedef BOOL (^CBLFilterBlock) (CBLSavedRevision* revision, __nullable NSDiction
 
 
 /** Returns the contents of the local document with the given ID, or nil if none exists. */
-- (nullable NSDictionary*) existingLocalDocumentWithID: (NSString*)localDocID;
+- (nullable CBLJSONDict*) existingLocalDocumentWithID: (NSString*)localDocID;
 
 /** Sets the contents of the local document with the given ID. Unlike CouchDB, no revision-ID
     checking is done; the put always succeeds. If the properties dictionary is nil, the document
     will be deleted. */
-- (BOOL) putLocalDocument: (nullable NSDictionary*)properties
+- (BOOL) putLocalDocument: (nullable CBLJSONDict*)properties
                    withID: (NSString*)localDocID
-                    error: (__nullable NSError**)outError;
+                    error: (NSError**)outError;
 
 /** Deletes the local document with the given ID. */
 - (BOOL) deleteLocalDocumentWithID: (NSString*)localDocID
-                             error: (__nullable NSError**)outError ;
+                             error: (NSError**)outError ;
 
 
 #pragma mark - VIEWS AND OTHER CALLBACKS:
@@ -199,18 +206,20 @@ typedef BOOL (^CBLFilterBlock) (CBLSavedRevision* revision, __nullable NSDiction
 #pragma mark - REPLICATION:
 
 /** Returns an array of all current, running CBLReplications involving this database. */
-- (NSArray*) allReplications;
+- (CBLArrayOf(CBLReplication*)*) allReplications;
 
 /** Creates a replication that will 'push' this database to a remote database at the given URL.
     This always creates a new replication, even if there is already one to the given URL.
     You must call -start on the replication to start it. */
-- (nullable CBLReplication*) createPushReplication: (NSURL*)url;
+- (CBLReplication*) createPushReplication: (NSURL*)url;
 
 /** Creates a replication that will 'pull' from a remote database at the given URL to this database.
     This always creates a new replication, even if there is already one from the given URL.
     You must call -start on the replication to start it. */
-- (nullable CBLReplication*) createPullReplication: (NSURL*)url;
+- (CBLReplication*) createPullReplication: (NSURL*)url;
 
+
+- (instancetype) init NS_UNAVAILABLE;
 
 @end
 
@@ -238,6 +247,10 @@ typedef BOOL (^CBLChangeEnumeratorBlock) (NSString* key,
 /** The contents of the current revision of the document, or nil if this is a new document. */
 @property (readonly, nullable) CBLSavedRevision* currentRevision;
 
+/** The source of the change: either the URL of the remote database that's being pulled from,
+    or a "user:" URL denoting the user authenticated through the listener's REST API, or nil. */
+@property (readonly, nonatomic) NSURL* source;
+
 /** Rejects the proposed new revision. */
 - (void) reject;
 
@@ -250,7 +263,7 @@ typedef BOOL (^CBLChangeEnumeratorBlock) (NSString* key,
 #pragma mark - CONVENIENCE METHODS:
 
 /** Returns an array of all the keys whose values are different between the current and new revisions. */
-@property (readonly) NSArray* changedKeys;
+@property (readonly) CBLArrayOf(NSString*)* changedKeys;
 
 /** Calls the 'enumerator' block for each key that's changed, passing both the old and new values.
     If the block returns NO, the enumeration stops and rejects the revision, and the method returns
@@ -260,6 +273,4 @@ typedef BOOL (^CBLChangeEnumeratorBlock) (NSString* key,
 @end
 
 
-#if __has_feature(nullability)
-#pragma clang assume_nonnull end
-#endif
+NS_ASSUME_NONNULL_END

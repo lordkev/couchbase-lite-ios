@@ -21,14 +21,15 @@
 #import "CBLDatabase+Replication.h"
 #import "CBLView+Internal.h"
 #import "CBL_Body.h"
+#import "CBL_BlobStoreWriter.h"
 #import "CBLMultipartDocumentReader.h"
+#import "CBLMultipartWriter.h"
 #import "CBL_Revision.h"
 #import "CBLDatabaseChange.h"
 #import "CBL_Server.h"
 #import "CBLPersonaAuthorizer.h"
 #import "CBLFacebookAuthorizer.h"
 #import "CBL_Replicator.h"
-#import "CBL_Pusher.h"
 #import "CBL_Attachment.h"
 #import "CBLInternal.h"
 #import "CBLMisc.h"
@@ -212,17 +213,35 @@
     return [self doAllDocs: options];
 }
 
-- (NSArray*) queryIteratorAllRows: (CBLQueryIteratorBlock) iterator {
+- (NSArray*) queryIteratorAllRows: (CBLQueryIteratorBlock) iterator
+{
+    CBLContentOptions options = self.contentOptions;
     NSMutableArray* result = $marray();
     CBLQueryRow* row;
     while (nil != (row = iterator())) {
         row.database = _db;
-        [result addObject: row.asJSONDictionary];
+        NSDictionary* dict = row.asJSONDictionary;
+        if (options != 0) {
+            NSDictionary* doc = dict[@"doc"];
+            if (doc) {
+                // Add content options:
+                CBL_Revision* rev = [CBL_Revision revisionWithProperties: doc];
+                CBLStatus status;
+                rev = [self applyOptions: options toRevision: rev status: &status];
+                if (rev) {
+                    NSMutableDictionary* mdict = [dict mutableCopy];
+                    mdict[@"doc"] = rev.properties;
+                    dict = mdict;
+                }
+            }
+        }
+        [result addObject: dict];
     }
     return result;
 }
 
-- (CBLStatus) doAllDocs: (CBLQueryOptions*)options {
+- (CBLStatus) doAllDocs: (CBLQueryOptions*)options
+{
     CBLStatus status;
     CBLQueryIteratorBlock iterator = [_db getAllDocs: options status: &status];
     if (!iterator)
@@ -253,20 +272,25 @@
                 NSString* docID = doc.cbl_id;
                 CBL_Revision* rev;
                 CBLStatus status;
+                NSError* error;
                 CBL_Body* docBody = [CBL_Body bodyWithProperties: doc];
                 if (noNewEdits) {
                     rev = [[CBL_Revision alloc] initWithBody: docBody];
                     NSArray* history = [CBLDatabase parseCouchDBRevisionHistory: doc];
-                    status = rev ? [db forceInsert: rev revisionHistory: history source: nil]
-                                 : kCBLStatusBadParam;
+                    status = rev ? [db forceInsert: rev
+                                   revisionHistory: history
+                                            source: self.source
+                                             error: &error] : kCBLStatusBadParam;
                 } else {
                     status = [self update: db
                                     docID: docID
                                      body: docBody
                                  deleting: NO
                             allowConflict: allOrNothing
-                               createdRev: &rev];
+                               createdRev: &rev
+                                    error: &error];
                 }
+
                 NSDictionary* result = nil;
                 if (status < 300) {
                     Assert(rev.revID);
@@ -275,11 +299,17 @@
                 } else if (status >= 500) {
                     return status;  // abort the whole thing if something goes badly wrong
                 } else if (allOrNothing) {
+                    if (error)
+                        _response.statusReason = error.localizedFailureReason;
                     return status;  // all_or_nothing backs out if there's any error
                 } else {
-                    NSString* error = nil;
-                    status = CBLStatusToHTTPStatus(status, &error);
-                    result = $dict({@"id", docID}, {@"error", error}, {@"status", @(status)});
+                    NSString* errorMessage = nil;
+                    status = CBLStatusToHTTPStatus(status, &errorMessage);
+                    NSString* reason = error.localizedFailureReason;
+                    if (reason)
+                        result = $dict({@"id", docID}, {@"error", errorMessage}, {@"reason", reason}, {@"status", @(status)});
+                    else
+                        result = $dict({@"id", docID}, {@"error", errorMessage}, {@"status", @(status)});
                 }
                 if (result)
                     [results addObject: result];
@@ -367,20 +397,20 @@
 - (CBLStatus) do_POST_replicate {
     NSDictionary* body = self.bodyAsDictionary;
     CBLStatus status;
-    CBL_Replicator* repl = [_dbManager replicatorWithProperties: body status: &status];
+    id<CBL_Replicator> repl = [_dbManager replicatorWithProperties: body status: &status];
     if (!repl)
         return status;
 
     if ([$castIf(NSNumber, body[@"cancel"]) boolValue]) {
         // Cancel replication:
-        if (!repl.running)
+        if (repl.status == kCBLReplicatorStopped)
             return kCBLStatusNotFound;
         [repl stop];
         return kCBLStatusOK;
     } else {
         // Start replication:
         [repl start];
-        if (repl.continuous || [$castIf(NSNumber, body[@"async"]) boolValue]) {
+        if (repl.settings.continuous || [$castIf(NSNumber, body[@"async"]) boolValue]) {
             _response.bodyObject = $dict({@"session_id", repl.sessionID});
             return kCBLStatusOK;
         } else {
@@ -396,7 +426,7 @@
 
 // subroutine of -do_POST_replicate
 - (void) replicationStopped: (NSNotification*)n {
-    CBL_Replicator* repl = n.object;
+    id<CBL_Replicator> repl = n.object;
     _response.status = CBLStatusFromNSError(repl.error, kCBLStatusServerError);
     [self sendResponseHeaders];
     [self.response setBodyObject: $dict({@"ok", (repl.error ?nil :$true)},
@@ -436,8 +466,8 @@
     // Get the current task info of all replicators:
     NSMutableArray* activity = $marray();
     for (CBLDatabase* db in _dbManager.allOpenDatabases) {
-        for (CBL_Replicator* repl in db.activeReplicators) {
-            [activity addObject: repl.activeTaskInfo];
+        for (id<CBL_Replicator> repl in db.activeReplicators) {
+            [activity addObject: [self activeTaskInfo: repl]];
         }
     }
 
@@ -469,9 +499,51 @@
 
 // subroutine of do_GET_active_tasks
 - (void) replicationChanged: (NSNotification*)n {
-    CBL_Replicator* repl = n.object;
+    id<CBL_Replicator> repl = n.object;
     if (repl.db.manager == _dbManager)
-        [self sendContinuousLine: repl.activeTaskInfo];
+        [self sendContinuousLine: [self activeTaskInfo: repl]];
+}
+
+
+- (NSDictionary*) activeTaskInfo: (id<CBL_Replicator>)repl {
+    static NSString* const kStatusName[] = {@"Stopped", @"Offline", @"Idle", @"Active"};
+    // For schema, see http://wiki.apache.org/couchdb/HttpGetActiveTasks
+    NSString* source = repl.settings.remote.absoluteString;
+    NSString* target = _db.name;
+    if (repl.settings.isPush) {
+        NSString* temp = source;
+        source = target;
+        target = temp;
+    }
+    NSString* status;
+    id progress = nil;
+    if (repl.status == kCBLReplicatorActive) {
+        NSUInteger processed = repl.changesProcessed;
+        NSUInteger total = repl.changesTotal;
+        status = $sprintf(@"Processed %u / %u changes",
+                          (unsigned)processed, (unsigned)total);
+        progress = (total>0) ? @(lroundf(100*(processed / (float)total))) : nil;
+    } else {
+        status = kStatusName[repl.status];
+    }
+    NSArray* error = nil;
+    NSError* errorObj = repl.error;
+    if (errorObj)
+        error = @[@(errorObj.code), errorObj.localizedDescription];
+
+    NSArray* activeRequests = nil;
+    if ([repl respondsToSelector: @selector(activeTasksInfo)])
+        activeRequests = repl.activeTasksInfo;
+    
+    return $dict({@"type", @"Replication"},
+                 {@"task", repl.sessionID},
+                 {@"source", source},
+                 {@"target", target},
+                 {@"continuous", (repl.settings.continuous ? $true : nil)},
+                 {@"status", status},
+                 {@"progress", progress},
+                 {@"x_active_requests", activeRequests},
+                 {@"error", error});
 }
 
 
@@ -509,11 +581,12 @@ static NSArray* parseJSONRevArrayQuery(NSString* queryStr) {
             includeAttachments = (options & kCBLIncludeAttachments) != 0;
             if (includeAttachments) {
                 sendMultipart = !mustSendJSON;
-                if (sendMultipart)
-                    options &= ~kCBLIncludeAttachments;
+                options &= ~kCBLIncludeAttachments;
             }
             CBLStatus status;
-            rev = [db getDocumentWithID: docID revisionID: revID options: options status: &status];
+            rev = [db getDocumentWithID: docID revisionID: revID withBody: YES status: &status];
+            if (rev)
+                rev = [self applyOptions: options toRevision: rev status: &status];
             if (!rev) {
                 if (status == kCBLStatusDeleted)
                     _response.statusReason = @"deleted";
@@ -527,22 +600,27 @@ static NSArray* parseJSONRevArrayQuery(NSString* queryStr) {
             return kCBLStatusNotFound;
         if ([self cacheWithEtag: rev.revID])        // set ETag and check conditional GET
             return kCBLStatusNotModified;
-        
-        if (includeAttachments) {
+
+        if (!isLocalDoc && includeAttachments) {
             int minRevPos = 1;
             NSArray* attsSince = parseJSONRevArrayQuery([self query: @"atts_since"]);
             NSString* ancestorID = [_db.storage findCommonAncestorOf: rev withRevIDs: attsSince];
             if (ancestorID)
                 minRevPos = [CBL_Revision generationFromRevID: ancestorID] + 1;
-            CBL_MutableRevision* stubbedRev = rev.mutableCopy;
-            [CBLDatabase stubOutAttachmentsIn: stubbedRev beforeRevPos: minRevPos
-                            attachmentsFollow: sendMultipart];
-            rev = stubbedRev;
+            CBL_MutableRevision* expandedRev = rev.mutableCopy;
+            CBLStatus status;
+            if (![db expandAttachmentsIn: expandedRev
+                               minRevPos: minRevPos
+                            allowFollows: sendMultipart
+                                  decode: ![self boolQuery: @"att_encoding_info"]
+                                  status: &status])
+                return status;
+            rev = expandedRev;
         }
 
         if (sendMultipart)
-            [_response setMultipartBody: [db multipartWriterForRevision: rev
-                                                            contentType: @"multipart/related"]];
+            [_response setMultipartBody: [self multipartWriterForRevision: rev
+                                                              contentType: @"multipart/related"]];
         else
             _response.body = rev.body;
         
@@ -559,8 +637,9 @@ static NSArray* parseJSONRevArrayQuery(NSString* queryStr) {
                 if (!includeDeleted && rev.deleted)
                     continue;
                 CBLStatus status;
-                CBL_Revision* loadedRev = [_db revisionByLoadingBody: rev options: options
-                                                              status: &status];
+                CBL_Revision* loadedRev = [_db revisionByLoadingBody: rev status: &status];
+                if (loadedRev)
+                    loadedRev = [self applyOptions: options toRevision: loadedRev status: &status];
                 if (loadedRev)
                     [result addObject: $dict({@"ok", loadedRev.properties})];
                 else if (status < kCBLStatusServerError)
@@ -580,7 +659,9 @@ static NSArray* parseJSONRevArrayQuery(NSString* queryStr) {
                     return kCBLStatusBadID;
                 CBLStatus status;
                 CBL_Revision* rev = [db getDocumentWithID: docID revisionID: revID
-                                                options: options status: &status];
+                                                 withBody: YES status: &status];
+                if (rev)
+                    rev = [self applyOptions: options toRevision: rev status: &status];
                 if (rev)
                     [result addObject: $dict({@"ok", rev.properties})];
                 else
@@ -598,12 +679,93 @@ static NSArray* parseJSONRevArrayQuery(NSString* queryStr) {
 }
 
 
+- (CBLMultipartWriter*) multipartWriterForRevision: (CBL_Revision*)rev
+                                       contentType: (NSString*)contentType
+{
+    CBLMultipartWriter* writer = [[CBLMultipartWriter alloc] initWithContentType: contentType
+                                                                        boundary: nil];
+    [writer setNextPartsHeaders: @{@"Content-Type": @"application/json"}];
+    [writer addData: rev.asJSON];
+    NSDictionary* attachments = rev.attachments;
+    for (NSString* attachmentName in attachments) {
+        NSDictionary* attachment = attachments[attachmentName];
+        if (attachment[@"follows"]) {
+            NSString* disposition = $sprintf(@"attachment; filename=%@", CBLQuoteString(attachmentName));
+            [writer setNextPartsHeaders: $dict({@"Content-Disposition", disposition})];
+
+            CBLStatus status;
+            CBL_Attachment* attachObj = [_db attachmentForDict: attachment named: attachmentName
+                                                        status: &status];
+            if (!attachObj)
+                return nil;
+            NSURL* fileURL = attachObj.contentURL;
+            if (fileURL)
+                [writer addFileURL: fileURL];
+            else
+                [writer addStream: attachObj.contentStream];
+        }
+    }
+    return writer;
+}
+
+
+- (CBL_Revision*) applyOptions: (CBLContentOptions)options
+                    toRevision: (CBL_Revision*)rev
+                        status: (CBLStatus*)outStatus
+{
+    if (options & (kCBLIncludeRevs | kCBLIncludeRevsInfo | kCBLIncludeConflicts |
+                   kCBLIncludeAttachments | kCBLIncludeLocalSeq)) {
+        NSMutableDictionary* dst = [rev.properties mutableCopy];
+        id<CBL_Storage> storage = _db.storage;
+
+        if (options & kCBLIncludeLocalSeq) {
+            dst[@"_local_seq"] = @(rev.sequence);
+        }
+        if (options & kCBLIncludeRevs) {
+            NSArray* revs = [_db getRevisionHistory: rev backToRevIDs: nil];
+            dst[@"_revisions"] = [CBLDatabase makeRevisionHistoryDict: revs];
+        }
+        if (options & kCBLIncludeRevsInfo) {
+            NSArray* revs = [_db getRevisionHistory: rev backToRevIDs: nil];
+            dst[@"_revs_info"] = [revs my_map: ^id(CBL_Revision* rev) {
+                NSString* status = @"available";
+                if (rev.deleted)
+                    status = @"deleted";
+                else if (rev.missing)
+                    status = @"missing";
+                return $dict({@"rev", [rev revID]}, {@"status", status});
+            }];
+        }
+        if (options & kCBLIncludeConflicts) {
+            CBL_RevisionList* revs = [storage getAllRevisionsOfDocumentID: rev.docID
+                                                                  onlyCurrent: YES];
+            if (revs.count > 1) {
+                dst[@"_conflicts"] = [revs.allRevisions my_map: ^(id aRev) {
+                    return ($equal(aRev, rev) || [(CBL_Revision*)aRev deleted]) ? nil : [aRev revID];
+                }];
+            }
+        }
+        CBL_MutableRevision* nuRev = [CBL_MutableRevision revisionWithProperties: dst];
+        if (options & kCBLIncludeAttachments) {
+            if (![_db expandAttachmentsIn: nuRev
+                                minRevPos: 0
+                             allowFollows: NO
+                                   decode: ![self boolQuery: @"att_encoding_info"]
+                                   status: outStatus])
+                return nil;
+        }
+        rev = nuRev;
+    }
+    return rev;
+}
+
+
 - (CBLStatus) do_GET: (CBLDatabase*)db docID: (NSString*)docID attachment: (NSString*)attachmentName {
     CBLStatus status;
     CBL_Revision* rev = [db getDocumentWithID: docID
                                  revisionID: [self query: @"rev"]  // often nil
-                                    options: kCBLNoBody
-                                     status: &status];        // all we need is revID & sequence
+                                     withBody: NO               // all we need is revID & sequence
+                                       status: &status];
     if (!rev)
         return status;
     if ([self cacheWithEtag: rev.revID])        // set ETag and check conditional GET
@@ -621,18 +783,18 @@ static NSArray* parseJSONRevArrayQuery(NSString* queryStr) {
         return status;
 
     if ($equal(_request.HTTPMethod, @"HEAD")) {
-        NSURL* fileURL = attachment.dataURL;
         if (_local) {
             // Let in-app clients know the location of the attachment file:
-            _response[@"Location"] = fileURL.absoluteString;
+            _response[@"Location"] = attachment.contentURL.absoluteString;
         }
         UInt64 length = attachment->length;
-        if (acceptEncoded && attachment->encoding == kCBLAttachmentEncodingGZIP && attachment->encodedLength)
+        if (acceptEncoded && attachment->encoding == kCBLAttachmentEncodingGZIP
+                          && attachment->encodedLength)
             length = attachment->encodedLength;
         _response[@"Content-Length"] = $sprintf(@"%llu", length);
         
     } else {
-        NSData* contents = acceptEncoded ? attachment.data : attachment.decodedData;
+        NSData* contents = acceptEncoded ? attachment.encodedContent : attachment.content;
         if (!contents)
             return kCBLStatusNotFound;
         _response.body = [CBL_Body bodyWithJSON: contents];   //FIX: This is a lie, it's not JSON
@@ -647,14 +809,17 @@ static NSArray* parseJSONRevArrayQuery(NSString* queryStr) {
 
 
 - (CBLStatus) update: (CBLDatabase*)db
-              docID: (NSString*)docID
-               body: (CBL_Body*)body
-           deleting: (BOOL)deleting
-      allowConflict: (BOOL)allowConflict
-         createdRev: (CBL_Revision**)outRev
+               docID: (NSString*)docID
+                body: (CBL_Body*)body
+            deleting: (BOOL)deleting
+       allowConflict: (BOOL)allowConflict
+          createdRev: (CBL_Revision**)outRev
+               error: (NSError**)outError
 {
-    if (body && !body.isValidJSON)
+    if (body && !body.isValidJSON) {
+        CBLStatusToOutNSError(kCBLStatusBadJSON, outError);
         return kCBLStatusBadJSON;
+    }
     
     NSString* prevRevID;
     
@@ -664,8 +829,10 @@ static NSArray* parseJSONRevArrayQuery(NSString* queryStr) {
         if (!docID) {
             // POST's doc ID may come from the _id field of the JSON body.
             docID = properties.cbl_id;
-            if (!docID && deleting)
+            if (!docID && deleting) {
+                CBLStatusToOutNSError(kCBLStatusBadID, outError);
                 return kCBLStatusBadID;
+            }
         }
         // PUT's revision ID comes from the JSON body.
         prevRevID = properties.cbl_rev;
@@ -680,28 +847,39 @@ static NSArray* parseJSONRevArrayQuery(NSString* queryStr) {
 
     CBL_MutableRevision* rev = [[CBL_MutableRevision alloc] initWithDocID: docID revID: nil
                                                                   deleted: deleting];
-    if (!rev)
+    if (!rev) {
+        CBLStatusToOutNSError(kCBLStatusBadID, outError);
         return kCBLStatusBadID;
+    }
     rev.body = body;
     
     CBLStatus status;
-    if ([docID hasPrefix: @"_local/"])
+    if ([docID hasPrefix: @"_local/"]) {
         *outRev = [db.storage putLocalRevision: rev
                                 prevRevisionID: prevRevID
                                       obeyMVCC: YES
                                         status: &status];
-    else
-        *outRev = [db putRevision: rev prevRevisionID: prevRevID
-                    allowConflict: allowConflict
-                           status: &status];
+
+        if (CBLStatusIsError(status)) {
+            CBLStatusToOutNSError(status, outError);
+        }
+    } else
+        *outRev = [db putDocID: docID
+                    properties: [rev.properties mutableCopy]
+                prevRevisionID: prevRevID
+                 allowConflict: allowConflict
+                        source: self.source
+                        status: &status
+                         error: outError];
     return status;
 }
 
 
 - (CBLStatus) update: (CBLDatabase*)db
-              docID: (NSString*)docID
-               body: (CBL_Body*)body
-           deleting: (BOOL)deleting
+               docID: (NSString*)docID
+                body: (CBL_Body*)body
+            deleting: (BOOL)deleting
+               error: (NSError**)outError
 {
     if (docID) {
         // On PUT/DELETE, get revision ID from either ?rev= query, If-Match: header, or doc body:
@@ -710,8 +888,11 @@ static NSArray* parseJSONRevArrayQuery(NSString* queryStr) {
         if (ifMatch) {
             if (!revParam)
                 revParam = ifMatch;
-            else if (!$equal(revParam, ifMatch))
-                return 400;
+            else if (!$equal(revParam, ifMatch)) {
+                CBLStatus status = kCBLStatusBadRequest;
+                CBLStatusToOutNSError(status, outError);
+                return status;
+            }
         }
         if (revParam && body) {
             id revProp = body.properties.cbl_rev;
@@ -721,7 +902,10 @@ static NSArray* parseJSONRevArrayQuery(NSString* queryStr) {
                 props[@"_rev"] = revParam;
                 body = [CBL_Body bodyWithProperties: props];
             } else if (!$equal(revProp, revParam)) {
-                return 400; // mismatch between _rev and rev
+                // mismatch between _rev and rev
+                CBLStatus status = kCBLStatusBadRequest;
+                CBLStatusToOutNSError(status, outError);
+                return status;
             }
         }
     }
@@ -730,7 +914,8 @@ static NSArray* parseJSONRevArrayQuery(NSString* queryStr) {
     CBLStatus status = [self update: db docID: docID body: body
                            deleting: deleting
                       allowConflict: NO
-                         createdRev: &rev];
+                         createdRev: &rev
+                              error: outError];
     if (status < 300) {
         [self cacheWithEtag: rev.revID];        // set ETag
         if (!deleting) {
@@ -795,7 +980,10 @@ static NSArray* parseJSONRevArrayQuery(NSString* queryStr) {
     if (CBLStatusIsError(status))
         return status;
     return [self readDocumentBodyThen: ^(CBL_Body *body) {
-        return [self update: db docID: nil body: body deleting: NO];
+        NSError* error;
+        CBLStatus status = [self update: db docID: nil body: body deleting: NO error: &error];
+        _response.statusReason = error.localizedFailureReason;
+        return status;
     }];
 }
 
@@ -804,7 +992,10 @@ static NSArray* parseJSONRevArrayQuery(NSString* queryStr) {
     return [self readDocumentBodyThen: ^CBLStatus(CBL_Body *body) {
         if (![self query: @"new_edits"] || [self boolQuery: @"new_edits"]) {
             // Regular PUT:
-            return [self update: db docID: docID body: body deleting: NO];
+            NSError* error;
+            CBLStatus status = [self update: db docID: docID body: body deleting: NO error: &error];
+            _response.statusReason = error.localizedFailureReason;
+            return status;
         } else {
             // PUT with new_edits=false -- forcible insertion of existing revision:
             CBL_Revision* rev = [[CBL_Revision alloc] initWithBody: body];
@@ -813,12 +1004,18 @@ static NSArray* parseJSONRevArrayQuery(NSString* queryStr) {
             if (!$equal(rev.docID, docID) || !rev.revID)
                 return kCBLStatusBadID;
             NSArray* history = [CBLDatabase parseCouchDBRevisionHistory: body.properties];
-            CBLStatus status = [_db forceInsert: rev revisionHistory: history source: nil];
+            NSError* error;
+            CBLStatus status = [_db forceInsert: rev
+                                revisionHistory: history
+                                         source: self.source
+                                          error: &error];
             if (!CBLStatusIsError(status)) {
                 _response.bodyObject = $dict({@"ok", $true},
                                              {@"id", rev.docID},
                                              {@"rev", rev.revID});
-            }
+            } else
+                _response.statusReason = error.localizedFailureReason;
+
             return status;
         }
     }];
@@ -826,22 +1023,28 @@ static NSArray* parseJSONRevArrayQuery(NSString* queryStr) {
 
 
 - (CBLStatus) do_DELETE: (CBLDatabase*)db docID: (NSString*)docID {
-    return [self update: db docID: docID body: nil deleting: YES];
+    NSError* error;
+    CBLStatus status = [self update: db docID: docID body: nil deleting: YES error: &error];
+    _response.statusReason = error.localizedFailureReason;
+    return status;
 }
 
 
 - (CBLStatus) updateAttachment: (NSString*)attachment
                         docID: (NSString*)docID
-                         body: (CBL_BlobStoreWriter*)body
+                          body: (CBL_BlobStoreWriter*)body
+                         error: (NSError**)outError
 {
     CBLStatus status;
-    CBL_Revision* rev = [_db updateAttachment: attachment 
-                                       body: body
-                                       type: [_request valueForHTTPHeaderField: @"Content-Type"]
-                                   encoding: kCBLAttachmentEncodingNone
-                                    ofDocID: docID
-                                      revID: ([self query: @"rev"] ?: self.ifMatch)
-                                     status: &status];
+    CBL_Revision* rev = [_db updateAttachment: attachment
+                                         body: body
+                                         type: [_request valueForHTTPHeaderField: @"Content-Type"]
+                                     encoding: kCBLAttachmentEncodingNone
+                                      ofDocID: docID
+                                        revID: ([self query: @"rev"] ?: self.ifMatch)
+                                       source: self.source
+                                       status: &status
+                                        error: outError];
     if (status < 300) {
         _response.bodyObject = $dict({@"ok", $true}, {@"id", rev.docID}, {@"rev", rev.revID});
         [self cacheWithEtag: rev.revID];
@@ -876,12 +1079,18 @@ static NSArray* parseJSONRevArrayQuery(NSString* queryStr) {
     }
     [blob finish];
 
-    return [self updateAttachment: attachment docID: docID body: blob];
+    NSError* error;
+    CBLStatus status = [self updateAttachment: attachment docID: docID body: blob error: &error];
+    _response.statusReason = error.localizedFailureReason;
+    return status;
 }
 
 
 - (CBLStatus) do_DELETE: (CBLDatabase*)db docID: (NSString*)docID attachment: (NSString*)attachment {
-    return [self updateAttachment: attachment docID: docID body: nil];
+    NSError* error;
+    CBLStatus status = [self updateAttachment: attachment docID: docID body: nil error: &error];
+    _response.statusReason = error.localizedFailureReason;
+    return status;
 }
 
 
@@ -929,7 +1138,7 @@ static NSArray* parseJSONRevArrayQuery(NSString* queryStr) {
     NSArray* rows = [self queryIteratorAllRows: iterator];
     id updateSeq = options->updateSeq ? @(view.lastSequenceIndexed) : nil;
     _response.bodyObject = $dict({@"rows", rows},
-                                 {@"total_rows", @(view.totalRows)},
+                                 {@"total_rows", @(view.currentTotalRows)},
                                  {@"offset", @(options->skip)},
                                  {@"update_seq", updateSeq});
     return kCBLStatusOK;

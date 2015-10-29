@@ -32,6 +32,8 @@
 // Adds a non-persistent credential to the NSURLCredentialStorage.
 void AddTemporaryCredential(NSURL* url, NSString* realm,
                             NSString* username, NSString* password);
+void RemoveTemporaryCredential(NSURL* url, NSString* realm,
+                               NSString* username, NSString* password);
 
 
 /** Base class for Couchbase Lite unit tests. */
@@ -43,8 +45,14 @@ void AddTemporaryCredential(NSURL* url, NSString* realm,
 /** Returns the contents of a named test fixture in the unit-test bundle. */
 - (NSData*) contentsOfTestFile: (NSString*)name;
 
+@property (readonly) NSInteger iOSVersion;      // Returns 0 on Mac OS
+@property (readonly) NSInteger macOSVersion;    // Returns 0 on iOS
+
 // internal:
 - (void) _assertEqualish: (id)a to: (id)b;
+
+- (void) allowWarningsIn: (void (^)())block;
+
 @end
 
 
@@ -57,11 +65,16 @@ void AddTemporaryCredential(NSURL* url, NSString* realm,
     CBLDatabase* db;
 }
 
+@property (readonly) CBLDatabase* db;
+
 // Closes and re-opens 'db'.
 - (void) reopenTestDB;
 
 // Deletes and re-creates 'db'
 - (void) eraseTestDB;
+
+// Enables encryption in the attachment store
+@property BOOL encryptedAttachmentStore;
 
 /** YES if the underlying data store is SQLite (not ForestDB). */
 @property (readonly) BOOL isSQLiteDB;
@@ -92,6 +105,9 @@ void AddTemporaryCredential(NSURL* url, NSString* realm,
 /** Same as remoteTestDBURL: but with a server that uses/requires SSL.
     The environment variable that controls this is CBL_SSL_TEST_SERVER. */
 - (NSURL*) remoteSSLTestDBURL: (NSString*)dbName;
+
+/** Never returns an HTTPS URL even if App Transport Security is present. */
+- (NSURL*) remoteNonSSLTestDBURL: (NSString*)dbName;
 
 /** A CBLAuthorizer to use when talking to the remote test server. */
 @property (readonly) id<CBLAuthorizer> authorizer;

@@ -17,7 +17,7 @@
 #import "CBLModelFactory.h"
 #import "CBLModelArray.h"
 #import "CBLDatabase+Attachments.h"
-#import "CouchbaseLitePrivate.h"
+#import "CBLInternal.h"
 #import "CBLMisc.h"
 #import "CBLBase64.h"
 
@@ -39,6 +39,7 @@
         if (document) {
             LogTo(CBLModel, @"%@ initWithDocument: %@ @%p", self.class, document, document);
             self.document = document;
+            _isNew = (document.currentRevisionID == nil);
             [self didLoadFromDocument];
         } else {
             LogTo(CBLModel, @"%@ initWithDatabase: %@", self.class, database);
@@ -48,6 +49,12 @@
         [self awakeFromInitializer];
     }
     return self;
+}
+
+
+- (instancetype) init NS_UNAVAILABLE {
+    NSAssert(NO, @"CBLModels cannot be initialized with -init");
+    return nil;
 }
 
 
@@ -101,6 +108,14 @@
                 self.class, CBLAbbreviate(self.document.documentID)];
 }
 
+
+- (id) debugQuickLookObject {
+    NSDictionary* props = [self propertiesToSave];
+    return $sprintf(@"%@ %@",
+                    [self class],
+                    [CBLJSON stringWithJSONObject: props options: CBLJSONWritingPrettyPrinted
+                                            error: NULL]);
+}
 
 #pragma mark - DOCUMENT / DATABASE:
 
@@ -483,13 +498,24 @@
 }
 
 
+typedef id (*idMsgSend)(id self, SEL sel);
+
 + (Class) itemClassForArrayProperty: (NSString*)property {
     SEL sel = NSSelectorFromString([property stringByAppendingString: @"ItemClass"]);
     if ([self respondsToSelector: sel]) {
-        return (Class)objc_msgSend(self, sel);
+        return ((idMsgSend)objc_msgSend)(self, sel);
     }
     return Nil;
 }
+
++ (NSString*) inverseRelationForArrayProperty: (NSString*)property {
+    SEL sel = NSSelectorFromString([property stringByAppendingString: @"InverseRelation"]);
+    if ([self respondsToSelector: sel]) {
+        return ((idMsgSend)objc_msgSend)(self, sel);
+    }
+    return nil;
+}
+
 
 
 - (CBLDatabase*) databaseForModelProperty: (NSString*)property {
@@ -520,6 +546,50 @@
                  declaredClass, doc, property, self, _document);
     }
     return value;
+}
+
+
+// Queries to find the value of a model-valued array property that's an inverse relation.
+- (NSArray*) findInverseOfRelation: (NSString*)relation
+                         fromClass: (Class)fromClass
+{
+    CBLModelFactory* factory = self.database.modelFactory;
+    CBLQueryBuilder* builder = [factory queryBuilderForClass: fromClass property: relation];
+    if (!builder) {
+        NSPredicate* pred;
+        if (fromClass) {
+            NSArray* types = [self.database.modelFactory documentTypesForClass: fromClass];
+            Assert(types.count > 0, @"Class %@ is not registered for any document types",
+                   fromClass);
+            pred = [NSPredicate predicateWithFormat: @"type in %@ and %K = $DOCID",
+                                 types, relation];
+        } else {
+            pred = [NSPredicate predicateWithFormat: @"%K = $DOCID", relation];
+        }
+        NSError* error;
+        builder = [[CBLQueryBuilder alloc] initWithDatabase: self.database
+                                                     select: nil
+                                             wherePredicate: pred
+                                                    orderBy: nil
+                                                      error: &error];
+        Assert(builder, @"Couldn't create query builder: %@", error);
+        [factory setQueryBuilder: builder forClass: fromClass property:relation];
+    }
+
+    CBLQuery* q = [builder createQueryWithContext: @{@"DOCID": self.document.documentID}];
+    NSError* error;
+    CBLQueryEnumerator* e = [q run: &error];
+    if (!e) {
+        Warn(@"Querying for inverse of %@.%@ failed: %@", fromClass, relation, error);
+        return nil;
+    }
+    NSMutableArray* docIDs = $marray();
+    for (CBLQueryRow* row in e)
+        [docIDs addObject: row.documentID];
+    return [[CBLModelArray alloc] initWithOwner: self
+                                       property: nil
+                                      itemClass: fromClass
+                                         docIDs: docIDs];
 }
 
 

@@ -6,16 +6,10 @@
 //  Copyright (c) 2012-2013 Couchbase, Inc. All rights reserved.
 //
 
-#import <Foundation/Foundation.h>
+#import "CBLBase.h"
 @class CBLDocument, CBLDatabase, CBLAttachment, CBLSavedRevision, CBLUnsavedRevision;
 
-#if __has_feature(nullability) // Xcode 6.3+
-#pragma clang assume_nonnull begin
-#else
-#define nullable
-#define __nullable
-#endif
-
+NS_ASSUME_NONNULL_BEGIN
 
 /** A revision of a CBLDocument.
     This is the abstract base class of CBLSavedRevision (existing revisions) and CBLNewRevision
@@ -47,17 +41,17 @@
 
 /** Returns the ancestry of this revision as an array of CBLRevisions, in chronological order.
     Older revisions are NOT guaranteed to have their properties available. */
-- (NSArray*) getRevisionHistory: (__nullable NSError**)outError;
+- (nullable CBLArrayOf(CBLRevision*)*) getRevisionHistory: (NSError**)outError;
 
 /** The revision's contents as parsed from JSON.
     Keys beginning with "_" are defined and reserved by CouchbaseLite; others are app-specific.
     The first call to this method may need to fetch the properties from disk, but subsequent calls
     are very cheap. */
-@property (readonly, nullable) NSDictionary* properties;
+@property (readonly, nullable) CBLJSONDict* properties;
 
 /** The user-defined properties, without the ones reserved by CouchbaseLite.
     This is based on -properties, with every key whose name starts with "_" removed. */
-@property (readonly, copy, nullable) NSDictionary* userProperties;
+@property (readonly, copy, nullable) CBLJSONDict* userProperties;
 
 /** Shorthand for [self.properties objectForKey: key]. */
 - (nullable id) propertyForKey: (NSString*)key;
@@ -68,13 +62,15 @@
 #pragma mark ATTACHMENTS
 
 /** The names of all attachments (an array of strings). */
-@property (readonly, nullable) NSArray* attachmentNames;
+@property (readonly, nullable) CBLArrayOf(NSString*)* attachmentNames;
 
 /** Looks up the attachment with the given name (without fetching its contents yet). */
 - (nullable CBLAttachment*) attachmentNamed: (NSString*)name;
 
 /** All attachments, as CBLAttachment objects. */
-@property (readonly, nullable) NSArray* attachments;
+@property (readonly, nullable) CBLArrayOf(CBLAttachment*)* attachments;
+
+- (instancetype) init NS_UNAVAILABLE;
 
 @end
 
@@ -93,11 +89,11 @@
 
 /** Creates and saves a new revision with the given properties.
     This will fail with a 412 error if the receiver is not the current revision of the document. */
-- (nullable CBLSavedRevision*) createRevisionWithProperties: (nullable NSDictionary*)properties
-                                                      error: (__nullable NSError**)outError;
+- (nullable CBLSavedRevision*) createRevisionWithProperties: (nullable CBLJSONDict*)properties
+                                                      error: (NSError**)outError;
 
 /** Deletes the document by creating a new deletion-marker revision. */
-- (nullable CBLSavedRevision*) deleteDocument: (__nullable NSError**)outError;
+- (nullable CBLSavedRevision*) deleteDocument: (NSError**)outError;
 
 @end
 
@@ -109,20 +105,20 @@
 // These properties are overridden to be settable:
 @property (readwrite) BOOL isDeletion;
 @property (readwrite, copy, nullable) NSMutableDictionary* properties;
-@property (readwrite, copy, nullable) NSDictionary* userProperties;
+@property (readwrite, copy, nullable) CBLJSONDict* userProperties;
 - (void) setObject: (nullable id)object forKeyedSubscript: (NSString*)key;
 
 /** Saves the new revision to the database.
     This will fail with a 412 error if its parent (the revision it was created from) is not the current revision of the document.
     Afterwards you should use the returned CBLSavedRevision instead of this object.
     @return  A new CBLSavedRevision representing the saved form of the revision. */
-- (nullable CBLSavedRevision*) save: (__nullable NSError**)outError;
+- (nullable CBLSavedRevision*) save: (NSError**)outError;
 
 /** A special variant of -save: that always adds the revision, even if its parent is not the
     current revision of the document.
     This can be used to resolve conflicts, or to create them. If you're not certain that's what you
     want to do, you should use the regular -save: method instead. */
-- (nullable CBLSavedRevision*) saveAllowingConflict: (__nullable NSError**)outError;
+- (nullable CBLSavedRevision*) saveAllowingConflict: (NSError**)outError;
 
 /** Creates, updates or deletes an attachment.
     The attachment data will be written to the database when the revision is saved.
@@ -153,6 +149,4 @@
 @end
 
 
-#if __has_feature(nullability)
-#pragma clang assume_nonnull end
-#endif
+NS_ASSUME_NONNULL_END

@@ -18,11 +18,13 @@
 #import "CBLSocketChangeTracker.h"
 #import "CBLRemoteRequest.h"
 #import "CBLAuthorizer.h"
+#import "CBLCookieStorage.h"
 #import "CBLStatus.h"
 #import "CBLBase64.h"
+#import "CBLGZip.h"
 #import "MYBlockUtils.h"
 #import "MYURLUtils.h"
-#import "WebSocketHTTPLogic.h"
+#import "BLIPHTTPLogic.h"
 #import <string.h>
 
 
@@ -31,9 +33,9 @@
 
 @implementation CBLSocketChangeTracker
 {
-    WebSocketHTTPLogic* _http;
     NSInputStream* _trackingInput;
     CFAbsoluteTime _startTime;
+    CBLGZip* _gzip;
     bool _gotResponseHeaders;
     bool _readyToRead;
 }
@@ -47,31 +49,11 @@
 
     NSURL* url = self.changesFeedURL;
 
-    if (!_http) {
-        NSMutableURLRequest* urlRequest = [NSMutableURLRequest requestWithURL: url];
-        if (self.usePOST) {
-            urlRequest.HTTPMethod = @"POST";
-            urlRequest.HTTPBody = self.changesFeedPOSTBody;
-            [urlRequest setValue: @"application/json" forHTTPHeaderField: @"Content-Type"];
-        }
-        _http = [[WebSocketHTTPLogic alloc] initWithURLRequest: urlRequest];
-        // Add headers from my .requestHeaders property:
-        [self.requestHeaders enumerateKeysAndObjectsUsingBlock: ^(id key, id value, BOOL *stop) {
-            _http[key] = value;
-        }];
-    }
-
     CFHTTPMessageRef request = [_http newHTTPRequest];
-
-    if (_authorizer && !_http.credential) {
-        // Let the Authorizer add its own credential:
-        NSString* authHeader = [_authorizer authorizeHTTPMessage: request forRealm: nil];
-        if (authHeader)
-            CFHTTPMessageSetHeaderFieldValue(request, CFSTR("Authorization"),
-                                             (__bridge CFStringRef)(authHeader));
-    }
+    CFHTTPMessageSetHeaderFieldValue(request, CFSTR("Accept-Encoding"), CFSTR("gzip"));
 
     // Now open the connection:
+    LogTo(SyncPerf, @"%@: %@ %@", self, (self.usePOST ?@"POST" :@"GET"), url.resourceSpecifier);
     LogTo(SyncVerbose, @"%@: %@ %@", self, (self.usePOST ?@"POST" :@"GET"), url.resourceSpecifier);
     CFReadStreamRef cfInputStream = CFReadStreamCreateForHTTPRequest(NULL, request);
     CFRelease(request);
@@ -82,12 +64,12 @@
     _http.handleRedirects = NO;  // CFStream will handle redirects instead
 
     // Configure HTTP proxy -- CFNetwork makes us do this manually, unlike NSURLConnection :-p
-    NSDictionary* proxy = url.my_proxySettings;
-    if (proxy) {
-        LogTo(ChangeTracker, @"Changes feed using proxy %@", proxy);
-        bool ok = CFReadStreamSetProperty(cfInputStream, kCFStreamPropertyHTTPProxy,
-                                          (CFDictionaryRef)proxy);
+    CFDictionaryRef proxySettings = CFNetworkCopySystemProxySettings();
+    if (proxySettings) {
+        LogTo(ChangeTracker, @"Changes feed using proxy settings %@", proxySettings);
+        __unused Boolean ok = CFReadStreamSetProperty(cfInputStream, kCFStreamPropertyHTTPProxy, proxySettings);
         Assert(ok);
+        CFRelease(proxySettings);
     }
 
     NSDictionary* tls = self.TLSSettings;
@@ -96,6 +78,7 @@
 
     _gotResponseHeaders = false;
     _readyToRead = NO;
+    _gzip = nil;
 
     _trackingInput = (NSInputStream*)CFBridgingRelease(cfInputStream);
     [_trackingInput setDelegate: self];
@@ -138,6 +121,13 @@
 
         trusted = [self checkServerTrust: sslTrust forURL: url];
         CFRelease(sslTrust);
+        if (!trusted) {
+            //TODO: This error could be made more precise
+            LogTo(ChangeTracker, @"%@: Rejected server certificate", self);
+            [self failedWithError: [NSError errorWithDomain: NSURLErrorDomain
+                                                       code: NSURLErrorServerCertificateUntrusted
+                                                   userInfo: nil]];
+        }
     }
     return trusted;
 }
@@ -147,21 +137,36 @@
     CFHTTPMessageRef response;
     response = (CFHTTPMessageRef) CFReadStreamCopyProperty((CFReadStreamRef)_trackingInput,
                                                            kCFStreamPropertyHTTPResponseHeader);
-    Assert(response);
+    if (!response) {
+        [self failedWithError: [NSError errorWithDomain: NSURLErrorDomain
+                                                   code: NSURLErrorNetworkConnectionLost
+                                               userInfo: nil]];
+        return NO;
+    }
+    CFAutorelease(response);
     _gotResponseHeaders = true;
+    LogTo(SyncPerf, @"%@ got HTTP response headers (%ld) after %.3f sec",
+          self, CFHTTPMessageGetResponseStatusCode(response), CFAbsoluteTimeGetCurrent()-_startTime);
     [_http receivedResponse: response];
-    CFRelease(response);
+    NSString* encoding = CFBridgingRelease(CFHTTPMessageCopyHeaderFieldValue(response,
+                                                                    CFSTR("Content-Encoding")));
+    BOOL compressed = [encoding isEqualToString: @"gzip"];
 
     if (_http.shouldContinue) {
         _retryCount = 0;
         _http = nil;
+        if (compressed)
+            _gzip = [[CBLGZip alloc] initForCompressing: NO];
+        NSDictionary* headers = CFBridgingRelease(CFHTTPMessageCopyAllHeaderFields(response));
+        [_client changeTrackerReceivedHTTPHeaders: headers];
         return YES;
     } else if (_http.shouldRetry) {
         [self clearConnection];
         [self retry];
         return NO;
     } else {
-        NSError* error = _http.error ?: CBLStatusToNSError(_http.httpStatus, _http.URL);
+        NSError* error = _http.error ?: CBLStatusToNSErrorWithInfo(_http.httpStatus,
+                                                                   nil, _http.URL, nil);
         [self failedWithError: error];
         return NO;
     }
@@ -180,23 +185,49 @@
 #pragma mark - STREAM HANDLING:
 
 
+- (BOOL) readGzippedBytes: (const void*)bytes length: (size_t)length {
+    __weak CBLSocketChangeTracker* weakSelf = self;
+    BOOL ok = [_gzip addBytes: bytes
+                       length: length
+                     onOutput: ^(const void *decompressedBytes, size_t decompressedLength) {
+        [weakSelf parseBytes: decompressedBytes length: decompressedLength];
+    }];
+    if (!ok) {
+        NSDictionary* info = @{NSLocalizedDescriptionKey: @"Invalid gzipped response data"};
+        [self failedWithError: [NSError errorWithDomain: @"zlib" code:_gzip.status userInfo: info]];
+    }
+    return ok;
+}
+
+
 - (void) readFromInput {
     Assert(_readyToRead);
     _readyToRead = false;
     uint8_t buffer[kReadLength];
-    NSInteger bytesRead = [_trackingInput read: buffer maxLength: sizeof(buffer)];
-    if (bytesRead > 0)
-        [self parseBytes: buffer length: bytesRead];
+    while (_trackingInput.hasBytesAvailable) {
+        NSInteger bytesRead = [_trackingInput read: buffer maxLength: sizeof(buffer)];
+        if (bytesRead > 0) {
+            if (_gzip)
+                [self readGzippedBytes: buffer length: bytesRead];
+            else
+                [self parseBytes: buffer length: bytesRead];
+        }
+    }
 }
 
 
 - (void) handleEOF {
     if (!_gotResponseHeaders) {
-        [self failedWithError: [NSError errorWithDomain: NSURLErrorDomain
-                                                   code: NSURLErrorNetworkConnectionLost
-                                               userInfo: nil]];
-        return;
+        [self readResponseHeader];
+        if (!_gotResponseHeaders)
+            return;
     }
+    self.paused = NO;   // parse any incoming bytes that have been waiting
+    if (_gzip) {
+        [self readGzippedBytes: NULL length: 0]; // flush gzip decoder
+        _gzip = nil;
+    }
+    LogTo(SyncPerf, @"%@ reached EOF after %.3f sec", self, CFAbsoluteTimeGetCurrent()-_startTime);
     if (_mode == kContinuous) {
         [self stop];
     } else if ([self endParsingData] >= 0) {

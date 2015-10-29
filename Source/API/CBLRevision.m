@@ -14,6 +14,7 @@
 //  and limitations under the License.
 
 #import "CouchbaseLitePrivate.h"
+#import "CBLInternal.h"
 #import "CBLDatabase+Attachments.h"
 #import "CBLDatabase+Insertion.h"
 #import "CBL_Revision.h"
@@ -40,7 +41,7 @@
 - (NSString*) revisionID                             {return nil;}
 - (NSString*) parentRevisionID                       {AssertAbstractMethod();}
 - (CBLSavedRevision*) parentRevision                 {AssertAbstractMethod();}
-- (NSArray*) getRevisionHistory: (NSError**)outError {AssertAbstractMethod();};
+- (NSArray*) getRevisionHistory: (NSError**)outError {AssertAbstractMethod();}
 - (NSDictionary*) properties                         {AssertAbstractMethod();}
 - (SequenceNumber) sequence                          {return 0;}
 
@@ -77,6 +78,12 @@
 - (NSString*) description {
     return $sprintf(@"%@[%@/%@]", [self class], self.document.abbreviatedID,
                     (self.revisionID ?: @""));
+}
+
+
+- (id) debugQuickLookObject {
+    return [CBLJSON stringWithJSONObject: self.properties
+                                 options: CBLJSONWritingPrettyPrinted error: NULL];
 }
 
 
@@ -163,6 +170,15 @@
     return self;
 }
 
+- (id) debugQuickLookObject {
+    if (self.propertiesAreLoaded)
+        return [super debugQuickLookObject];
+    else
+        return $sprintf(@"{\n\t\"_id\":\"%@\",\n\t\"_rev\":\"%@\"\n}\n(sorry, data not loaded)",
+                        self.document.documentID, self.revisionID);
+
+}
+
 - (BOOL) isEqual: (id)object {
     if (object == self)
         return YES;
@@ -193,7 +209,7 @@
 
 - (bool) loadProperties {
     CBLStatus status;
-    CBL_Revision* rev = [self.database revisionByLoadingBody: _rev options: 0 status: &status];
+    CBL_Revision* rev = [self.database revisionByLoadingBody: _rev status: &status];
     if (!rev) {
         Warn(@"Couldn't load body/sequence of %@: %d", self, status);
         return false;
@@ -236,10 +252,25 @@
     return _rev.properties != nil;
 }
 
+- (NSData*) JSONData {
+    NSData* json = _rev.asJSON;
+    if (!json) {
+        if ([self loadProperties])
+            json = _rev.asJSON;
+    }
+    return json;
+}
+
 
 - (NSArray*) getRevisionHistory: (NSError**)outError {
+    return [self getRevisionHistoryBackToRevisionIDs: nil error: outError];
+}
+
+- (NSArray*) getRevisionHistoryBackToRevisionIDs: (NSArray*)ancestorIDs
+                                           error: (NSError**)outError
+{
     NSMutableArray* history = $marray();
-    for (CBL_Revision* rev in [self.database.storage getRevisionHistory: _rev]) {
+    for (CBL_Revision* rev in [self.database getRevisionHistory: _rev backToRevIDs: ancestorIDs]) {
         CBLSavedRevision* revision;
         if ($equal(rev.revID, _rev.revID))
             revision = self;
@@ -288,7 +319,7 @@
     NSMutableDictionary* _properties;
 }
 
-@synthesize parentRevisionID=_parentRevID, properties=_properties;
+@synthesize parentRevisionID=_parentRevID;
 @dynamic isDeletion, userProperties;     // Necessary because this class redeclares them
 
 - (instancetype) initWithDocument: (CBLDocument*)doc parent: (CBLSavedRevision*)parent {
@@ -306,6 +337,16 @@
 
 - (CBLSavedRevision*) parentRevision {
     return _parentRevID ? [_document revisionWithID: _parentRevID] : nil;
+}
+
+- (void) setProperties: (NSMutableDictionary*)properties {
+    if (_properties != properties) {
+        _properties = [properties mutableCopy];
+    }
+}
+
+- (NSMutableDictionary*)properties {
+    return _properties;
 }
 
 - (NSArray*) getRevisionHistory: (NSError**)outError {
@@ -367,12 +408,14 @@
     [atts setValue: attachment forKey: name];
     _properties[@"_attachments"] = atts;
     attachment.name = name;
-    attachment.revision = self;
+    
+    // NOTE: Not setting the revision to the attachment object (attachment.revision = self) as
+    // [1] The UnsavedRevision object is not used during save operation
+    // [2] Setting the UnsavedRevision object here will cause the circular reference memory leak.
 }
 
 - (void) removeAttachmentNamed: (NSString*)name {
     [self _addAttachment: nil named: name];
 }
-
 
 @end

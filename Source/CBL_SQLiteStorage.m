@@ -3,8 +3,15 @@
 //  CouchbaseLite
 //
 //  Created by Jens Alfke on 1/14/15.
+//  Copyright (c) 2011-2015 Couchbase, Inc. All rights reserved.
 //
-//
+//  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file
+//  except in compliance with the License. You may obtain a copy of the License at
+//    http://www.apache.org/licenses/LICENSE-2.0
+//  Unless required by applicable law or agreed to in writing, software distributed under the
+//  License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+//  either express or implied. See the License for the specific language governing permissions
+//  and limitations under the License.
 
 #import "CBL_SQLiteStorage.h"
 #import "CBL_SQLiteViewStorage.h"
@@ -14,8 +21,11 @@
 #import "CBL_Attachment.h"
 #import "CBLMisc.h"
 #import "CBJSONEncoder.h"
+#import "CBLSymmetricKey.h"
+#import "CBLInternal.h"
 #import "CouchbaseLitePrivate.h"
 #import "ExceptionUtils.h"
+#import "MYAction.h"
 
 #import "FMDatabase.h"
 #import "FMDatabaseAdditions.h"
@@ -23,6 +33,8 @@
 
 
 #define kDBFilename @"db.sqlite3"
+
+#define kSQLiteMMapSize (50*1024*1024)
 
 #define kDocIDCacheSize 1000
 
@@ -33,6 +45,13 @@
 
 #define kLocalCheckpointDocId @"CBL_LocalCheckpoint"
 
+#ifdef MOCK_ENCRYPTION
+BOOL CBLEnableMockEncryption = NO;
+#else
+#define CBLEnableMockEncryption NO
+#endif
+
+static unsigned sSQLiteVersion;
 
 static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **apVal);
 
@@ -40,13 +59,42 @@ static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **a
 @implementation CBL_SQLiteStorage
 {
     NSString* _directory;
-    __weak CBLManager* _manager;
     BOOL _readOnly;
     NSCache* _docIDs;
+    CBLSymmetricKey* _encryptionKey;
 }
 
 @synthesize delegate=_delegate, autoCompact=_autoCompact,
             maxRevTreeDepth=_maxRevTreeDepth, fmdb=_fmdb;
+
+
++ (void) firstTimeSetup {
+    // Test the version of the actual SQLite implementation at runtime. Necessary because
+    // the app might be linked with a custom version of SQLite (like SQLCipher) instead of the
+    // system library, so the actual version/features may differ from what was declared in
+    // sqlite3.h at compile time.
+    Log(@"Couchbase Lite using SQLite version %s (%s)",
+        sqlite3_libversion(), sqlite3_sourceid());
+#if 0
+    for (int i=0; true; i++) {
+        const char* opt = sqlite3_compileoption_get(i);
+        if (!opt)
+            break;
+        Log(@"SQLite option '%s'", opt);
+    }
+#endif
+    sSQLiteVersion = sqlite3_libversion_number();
+    Assert(sSQLiteVersion >= 3007000,
+           @"SQLite library is too old (%s); needs to be at least 3.7", sqlite3_libversion());
+
+    // Enable memory-mapped I/O if available
+#ifndef SQLITE_CONFIG_MMAP_SIZE
+#define SQLITE_CONFIG_MMAP_SIZE    22  /* sqlite3_int64, sqlite3_int64 */
+#endif
+    int err = sqlite3_config(SQLITE_CONFIG_MMAP_SIZE, (SInt64)kSQLiteMMapSize, (SInt64)-1);
+    if (err != SQLITE_OK)
+        Log(@"FYI, couldn't enable SQLite mmap: error %d", err);
+}
 
 
 #pragma mark - OPEN/CLOSE:
@@ -58,15 +106,24 @@ static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **a
 }
 
 
+- (void) setEncryptionKey:(CBLSymmetricKey *)key {
+    _encryptionKey = key;
+}
+
+
 /** Opens storage. Files will be created in the directory, which must already exist. */
 - (BOOL) openInDirectory: (NSString*)directory
                 readOnly: (BOOL)readOnly
                  manager: (CBLManager*)manager
                    error: (NSError**)error
 {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        [[self class] firstTimeSetup];
+    });
+
     _directory = [directory copy];
     _readOnly = readOnly;
-    _manager = manager;
     NSString* path = [_directory stringByAppendingPathComponent: kDBFilename];
     _fmdb = [[CBL_FMDatabase alloc] initWithPath: path];
     _fmdb.dispatchQueue = manager.dispatchQueue;
@@ -89,6 +146,14 @@ static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **a
     for (NSString* quotedStatement in [statements componentsSeparatedByString: @";"]) {
         NSString* statement = [quotedStatement stringByReplacingOccurrencesOfString: @"|"
                                                                          withString: @";"];
+        if (sSQLiteVersion < 3008000) {
+            // No partial index support before SQLite 3.8
+            if ([statement rangeOfString: @"CREATE INDEX "].length > 0) {
+                NSRange where = [statement rangeOfString: @"WHERE"];
+                if (where.length > 0)
+                    statement = [statement substringToIndex: where.location];
+            }
+        }
         if (statement.length && ![_fmdb executeUpdate: statement]) {
             if (outError) *outError = self.fmdbError;
             return NO;
@@ -124,11 +189,16 @@ static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **a
         flags |= SQLITE_OPEN_READONLY;
     else
         flags |= SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
-    LogTo(CBLDatabase, @"Open %@ (flags=%X)", _fmdb.databasePath, flags);
+
+    LogTo(CBLDatabase, @"Open %@ (flags=%X%@)",
+          _fmdb.databasePath, flags, (_encryptionKey ? @", encryption key given" : nil));
     if (![_fmdb openWithFlags: flags]) {
         if (outError) *outError = self.fmdbError;
         return NO;
     }
+
+    if (![self decryptWithKey: _encryptionKey error: outError])
+        return NO;
 
     // Register CouchDB-compatible JSON collation functions:
     sqlite3* dbHandle = _fmdb.sqliteHandle;
@@ -151,6 +221,147 @@ static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **a
 }
 
 
+// Give SQLCipher the encryption key, if provided:
+- (BOOL) decryptWithKey: (CBLSymmetricKey*)encryptionKey error: (NSError**)outError {
+    BOOL hasRealEncryption = sqlite3_compileoption_used("SQLITE_HAS_CODEC") != 0;
+#ifdef MOCK_ENCRYPTION
+    if (!hasRealEncryption && CBLEnableMockEncryption)
+        return [self mockDecryptWithKey: encryptionKey error: outError];
+#endif
+
+    if (encryptionKey) {
+        if (!hasRealEncryption) {
+            Warn(@"CBL_SQLiteStorage: encryption not available (app not built with SQLCipher)");
+            return CBLStatusToOutNSError(kCBLStatusNotImplemented,  outError);
+        } else {
+            // http://sqlcipher.net/sqlcipher-api/#key
+            if (![_fmdb executeUpdate: $sprintf(@"PRAGMA key = \"x'%@'\"",encryptionKey.hexData)]) {
+                Warn(@"CBL_SQLiteStorage: 'pragma key' failed (SQLite error %d)",
+                     self.lastDbStatus);
+                if (outError) *outError = self.fmdbError;
+                return NO;
+            }
+        }
+    }
+
+    // Verify that encryption key is correct (or db is unencrypted, if no key given):
+    if ([_fmdb intForQuery:@"SELECT count(*) FROM sqlite_master"] == 0) {
+        int err = _fmdb.lastErrorCode;
+        if (err) {
+            Warn(@"CBL_SQLiteStorage: database is unreadable (err %d)", err);
+            if (outError) {
+                if (err == SQLITE_NOTADB)
+                    CBLStatusToOutNSError(kCBLStatusUnauthorized, outError);
+                else
+                    *outError = self.fmdbError;
+            }
+            return NO;
+        }
+    }
+    return YES;
+}
+
+
+#ifdef MOCK_ENCRYPTION
+- (BOOL) mockDecryptWithKey: (CBLSymmetricKey*)encryptionKey error: (NSError**)outError {
+    NSData* givenKeyData = encryptionKey ? encryptionKey.keyData : [NSData data];
+    NSString* keyPath = [_directory stringByAppendingPathComponent: @"mock_key"];
+    NSData* actualKeyData = [NSData dataWithContentsOfFile: keyPath];
+    if (!actualKeyData) {
+        // Save key (which may be empty) the first time:
+        [givenKeyData writeToFile: keyPath atomically: YES];
+    } else {
+        // After that, compare the keys:
+        if (![actualKeyData isEqual: givenKeyData])
+            return CBLStatusToOutNSError(kCBLStatusUnauthorized, outError);
+    }
+    return YES;
+}
+#endif
+
+
+- (BOOL) checkUpdate: (BOOL)updateResult error: (NSError**)outError {
+    if (!updateResult && outError)
+        *outError = self.fmdbError;
+    return updateResult;
+}
+
+
+- (MYAction*) actionToChangeEncryptionKey: (CBLSymmetricKey*)newKey {
+    BOOL hasRealEncryption = sqlite3_compileoption_used("SQLITE_HAS_CODEC") != 0;
+    if (!hasRealEncryption) {
+#ifdef MOCK_ENCRYPTION
+        if (!CBLEnableMockEncryption)
+#endif
+            return nil;
+    }
+
+    MYAction* action = [MYAction new];
+
+    __block BOOL dbWasClosed = NO;
+    NSString* tempPath;
+#ifdef MOCK_ENCRYPTION
+    if (!hasRealEncryption) {
+        NSData* givenKeyData = newKey ? newKey.keyData : [NSData data];
+        NSString* oldKeyPath = [_directory stringByAppendingPathComponent: @"mock_key"];
+        NSString* newKeyPath = [_directory stringByAppendingPathComponent: @"mock_new_key"];
+        [givenKeyData writeToFile: newKeyPath atomically: YES];
+        [action addAction: [MYAction moveFile: newKeyPath toPath: oldKeyPath]];
+    } else
+#endif
+    {
+        // Make a path for a temporary database file:
+        tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent: CBLCreateUUID()];
+        [action addPerform: nil backOut: ^BOOL(NSError **outError) {
+            return [[NSFileManager defaultManager] removeItemAtPath: tempPath error: outError];
+        } cleanUp: nil];
+
+        // Create & attach a temporary database encrypted with the new key:
+        [action addPerform:^BOOL(NSError **outError) {
+            NSString* sql;
+            if (newKey)
+                sql = $sprintf(@"ATTACH DATABASE ? AS rekeyed_db KEY \"x'%@'\"", newKey.hexData);
+            else
+                sql = @"ATTACH DATABASE ? AS rekeyed_db KEY ''";
+            return [self checkUpdate: [_fmdb executeUpdate: sql, tempPath] error: outError];
+        } backOutOrCleanUp:^BOOL(NSError **outError) {
+            return dbWasClosed ||
+                        [self checkUpdate: [_fmdb executeUpdate: @"DETACH DATABASE rekeyed_db"]
+                                    error: outError];
+        }];
+
+        // Export the current database's contents to the new one:
+        // <https://www.zetetic.net/sqlcipher/sqlcipher-api/#sqlcipher_export>
+        [action addPerform:^BOOL(NSError **outError) {
+            NSString* vers = $sprintf(@"PRAGMA rekeyed_db.user_version = %d", self.schemaVersion);
+            return [self checkUpdate: [_fmdb executeUpdate:@"SELECT sqlcipher_export('rekeyed_db')"]
+                               error: outError]
+                && [self checkUpdate: [_fmdb executeUpdate: vers]
+                               error: outError];
+        } backOut: NULL cleanUp: NULL];
+    }
+
+    // Close the database (and re-open it on cleanup):
+    [action addPerform: ^BOOL(NSError **outError) {
+        [_fmdb close];
+        dbWasClosed = YES;
+        return YES;
+    } backOut: ^BOOL(NSError **outError) {
+        return [self open: outError];
+    } cleanUp: ^BOOL(NSError **outError) {
+        [self setEncryptionKey: newKey];
+        return [self open: outError];
+    }];
+
+    // Overwrite the old db file with the new one:
+    if (hasRealEncryption) {
+        [action addAction: [MYAction moveFile: tempPath toPath: _fmdb.databasePath]];
+    }
+
+    return action;
+}
+
+
 - (BOOL) open: (NSError**)outError {
     LogTo(CBLDatabase, @"Opening %@", self);
     if (![self openFMDB: outError])
@@ -160,7 +371,7 @@ static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **a
     __unused int dbVersion = self.schemaVersion;
     
     // Incompatible version changes increment the hundreds' place:
-    if (dbVersion >= 100) {
+    if (dbVersion >= 200) {
         Warn(@"CBLDatabase: Database version (%d) is newer than I know how to work with", dbVersion);
         [_fmdb close];
         if (outError) *outError = [NSError errorWithDomain: @"CouchbaseLite" code: 1 userInfo: nil]; //FIX: Real code
@@ -168,7 +379,7 @@ static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **a
     }
 
     BOOL isNew = (dbVersion == 0);
-    if (isNew && ![self initialize: @"BEGIN TRANSACTION" error: outError])
+    if (isNew && ![self initialize: @"PRAGMA journal_mode=WAL; BEGIN TRANSACTION" error: outError])
         return NO;
 
     if (dbVersion < 17) {
@@ -219,8 +430,6 @@ static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **a
                 key TEXT PRIMARY KEY,\
                 value TEXT);\
             \
-            CREATE VIRTUAL TABLE fulltext USING fts4(content, tokenize=unicodesn);\
-            CREATE VIRTUAL TABLE bboxes USING rtree(rowid, x0, x1, y0, y1);\
             PRAGMA user_version = 17";             // at the end, update user_version
         //OPT: Would be nice to use partial indexes but that requires SQLite 3.8 and makes the
         // db file only readable by SQLite 3.8+, i.e. the file would not be portable to iOS 8
@@ -232,8 +441,28 @@ static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **a
         dbVersion = 17;
     }
 
+    if (dbVersion < 18) {
+        NSString *schema = @"\
+            ALTER TABLE revs ADD COLUMN doc_type TEXT;\
+            PRAGMA user_version = 18";             // at the end, update user_version
+        if (![self initialize: schema error: outError])
+            return NO;
+        dbVersion = 18;
+    }
+
+    if (dbVersion < 101) {
+        NSString *schema = @"\
+        PRAGMA user_version = 101";
+        if (![self initialize: schema error: outError])
+            return NO;
+        dbVersion = 101;
+    }
+
     if (isNew && ![self initialize: @"END TRANSACTION" error: outError])
         return NO;
+
+    if (!isNew)
+        [self optimizeSQLIndexes];          // runs ANALYZE query
 
 #if DEBUG
     _fmdb.crashOnErrors = YES;
@@ -265,6 +494,8 @@ static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **a
             return kCBLStatusDBBusy;
         case SQLITE_CORRUPT:
             return kCBLStatusCorruptError;
+        case SQLITE_NOTADB:
+            return kCBLStatusUnauthorized; // DB is probably encrypted (SQLCipher)
         default:
             LogTo(CBLDatabase, @"Other _fmdb.lastErrorCode %d", _fmdb.lastErrorCode);
             return kCBLStatusDBError;
@@ -330,6 +561,11 @@ static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **a
     return ok;
 }
 
+// Runs the block inside a transaction. If the block returns an error status, or raises an
+// exception, the transaction is aborted and any changes rolled back. If this was a nested
+// transaction, only its changes are rolled back, not any from the outer transaction.
+// (Also supports retrying the block if it fails with a SQLite "BUSY" error, but this shouldn't
+// occur anymore now that our hacked FMDB uses a mutex to enforce database locking.)
 - (CBLStatus) inTransaction: (CBLStatus(^)())block {
     CBLStatus status;
     int retries = 0;
@@ -359,13 +595,31 @@ static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **a
     return status;
 }
 
+// This is like -inTransaction: except that it will not create _nested_ SQLite transactions,
+// only the outer one. There turns out to be significant overhead in a nested transaction, so in
+// cases where you just need to exclude other threads, and don't need to be able to roll back
+// the change you're making, this method is cheaper.
+- (CBLStatus) inOuterTransaction: (CBLStatus(^)())block {
+    if (!self.inTransaction)
+        return [self inTransaction: block];
+    // Instead of a nested transaction, just run the block and catch exceptions:
+    CBLStatus status;
+    @try {
+        status = block();
+    } @catch (NSException* x) {
+        MYReportException(x, @"CBLDatabase transaction");
+        status = kCBLStatusException;
+    }
+    return status;
+}
+
 
 #pragma mark - DOCUMENTS:
 
 
 - (CBL_MutableRevision*) getDocumentWithID: (NSString*)docID
                                 revisionID: (NSString*)revID
-                                   options: (CBLContentOptions)options
+                                  withBody: (BOOL)withBody
                                     status: (CBLStatus*)outStatus
 {
     SInt64 docNumericID = [self getDocNumericID: docID];
@@ -376,8 +630,8 @@ static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **a
 
     CBL_MutableRevision* result = nil;
     CBLStatus status;
-    NSMutableString* sql = [NSMutableString stringWithString: @"SELECT revid, deleted, sequence, no_attachments"];
-    if (!(options & kCBLNoBody))
+    NSMutableString* sql = [NSMutableString stringWithString: @"SELECT revid, deleted, sequence"];
+    if (withBody)
         [sql appendString: @", json"];
     if (revID)
         [sql appendString: @" FROM revs WHERE revs.doc_id=? AND revid=? AND json notnull LIMIT 1"];
@@ -395,15 +649,8 @@ static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **a
         BOOL deleted = [r boolForColumnIndex: 1];
         result = [[CBL_MutableRevision alloc] initWithDocID: docID revID: revID deleted: deleted];
         result.sequence = [r longLongIntForColumnIndex: 2];
-        
-        if (options != kCBLNoBody) {
-            NSData* json = nil;
-            if (!(options & kCBLNoBody))
-                json = [r dataNoCopyForColumnIndex: 4];
-            if ([r boolForColumnIndex: 3]) // no_attachments == true
-                options |= kCBLNoAttachments;
-            [self expandStoredJSON: json intoRevision: result options: options];
-        }
+        if (withBody)
+            result.asJSON = [r dataNoCopyForColumnIndex: 3];
         status = kCBLStatusOK;
     }
     [r close];
@@ -415,7 +662,7 @@ static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **a
 
 - (BOOL) existsDocumentWithID: (NSString*)docID revisionID: (NSString*)revID {
     CBLStatus status;
-    return [self getDocumentWithID: docID revisionID: revID options: kCBLNoBody status: &status] != nil;
+    return [self getDocumentWithID: docID revisionID: revID withBody: NO status: &status] != nil;
 }
 
 
@@ -427,20 +674,20 @@ static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **a
     CBL_MutableRevision* result = nil;
     CBLStatus status;
     CBL_FMResultSet *r = [_fmdb executeQuery:
-                          @"SELECT revid, deleted, no_attachments, json FROM revs WHERE sequence=?",
+                          @"SELECT revid, deleted, json FROM revs WHERE sequence=?",
                           @(sequence)];
     if (!r) {
         status = self.lastDbError;
     } else if (![r next]) {
         status = kCBLStatusNotFound;
     } else {
+        NSString* revID = [r stringForColumnIndex: 0];
+        BOOL deleted = [r boolForColumnIndex: 1];
         result = [[CBL_MutableRevision alloc] initWithDocID: docID
-                                                      revID: [r stringForColumnIndex: 0]
-                                                    deleted: [r boolForColumnIndex: 1]];
+                                                      revID: revID
+                                                    deleted: deleted];
         result.sequence = sequence;
-        [self expandStoredJSON: [r dataNoCopyForColumnIndex: 3]
-                  intoRevision: result
-                       options: ([r boolForColumnIndex: 2] ? kCBLNoAttachments : 0)];
+        result.asJSON =[r dataNoCopyForColumnIndex: 2];
         status = kCBLStatusOK;
     }
     [r close];
@@ -450,10 +697,8 @@ static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **a
 }
 
 
-- (CBLStatus) loadRevisionBody: (CBL_MutableRevision*)rev
-                       options: (CBLContentOptions)options
-{
-    if (rev.body && options==0 && rev.sequence)
+- (CBLStatus) loadRevisionBody: (CBL_MutableRevision*)rev {
+    if (rev.body && rev.sequence)
         return kCBLStatusOK;  // no-op
     Assert(rev.docID && rev.revID);
     SInt64 docNumericID = [self getDocNumericID: rev.docID];
@@ -467,71 +712,30 @@ static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **a
     CBLStatus status = kCBLStatusNotFound;
     if ([r next]) {
         // Found the rev. But the JSON still might be null if the database has been compacted.
-        status = kCBLStatusOK;
-        rev.sequence = [r longLongIntForColumnIndex: 0];
-        [self expandStoredJSON: [r dataNoCopyForColumnIndex: 1] intoRevision: rev options: options];
+        NSData* json = [r dataNoCopyForColumnIndex: 1];
+        if (json) {
+            status = kCBLStatusOK;
+            rev.sequence = [r longLongIntForColumnIndex: 0];
+            rev.asJSON = json;
+        }
     }
     [r close];
     return status;
 }
 
 
-/** Inserts the _id, _rev and _attachments properties into the JSON data and stores it in rev.
- Rev must already have its revID and sequence properties set. */
-- (void) expandStoredJSON: (NSData*)json
-             intoRevision: (CBL_MutableRevision*)rev
-                  options: (CBLContentOptions)options
+- (CBL_MutableRevision*) revisionWithDocID: (NSString*)docID
+                                     revID: (NSString*)revID
+                                   deleted: (BOOL)deleted
+                                  sequence: (SequenceNumber)sequence
+                                      json: (NSData*)json
 {
-    NSMutableDictionary* extra = $mdict();
-    [self extraPropertiesForRevision: rev options: options into: extra];
-    if (json.length > 0) {
-        rev.asJSON = [CBLJSON appendDictionary: extra toJSONDictionaryData: json];
-    } else {
-        rev.properties = extra;
-        if (json == nil)
-            rev.missing = true;
-    }
-}
-
-
-/** Inserts the _id, _rev, _attachments etc. properties into the dictionary 'dst'.
-    Rev must already have its revID and sequence properties set. */
-- (void) extraPropertiesForRevision: (CBL_Revision*)rev
-                            options: (CBLContentOptions)options
-                               into: (NSMutableDictionary*)dst
-{
-    dst[@"_id"] = rev.docID;
-    dst[@"_rev"] = rev.revID;
-    if (rev.deleted)
-        dst[@"_deleted"] = $true;
-
-    // Get more optional stuff to put in the properties:
-    //OPT: This probably ends up making redundant SQL queries if multiple options are enabled.
-    if (options & kCBLIncludeLocalSeq)
-        dst[@"_local_seq"] = @(rev.sequence);
-
-    if (options & kCBLIncludeRevs)
-        dst[@"_revisions"] = [self getRevisionHistoryDict: rev startingFromAnyOf: nil];
-    
-    if (options & kCBLIncludeRevsInfo) {
-        dst[@"_revs_info"] = [[self getRevisionHistory: rev] my_map: ^id(CBL_Revision* rev) {
-            NSString* status = @"available";
-            if (rev.deleted)
-                status = @"deleted";
-            else if (rev.missing)
-                status = @"missing";
-            return $dict({@"rev", [rev revID]}, {@"status", status});
-        }];
-    }
-    
-    if (options & kCBLIncludeConflicts) {
-        CBL_RevisionList* revs = [self getAllRevisionsOfDocumentID: rev.docID onlyCurrent: YES];
-        if (revs.count > 1) {
-            dst[@"_conflicts"] = [revs.allRevisions my_map: ^(id aRev) {
-                return ($equal(aRev, rev) || [(CBL_Revision*)aRev deleted]) ? nil : [aRev revID];
-            }];
-        }
-    }
+    CBL_MutableRevision* rev = [[CBL_MutableRevision alloc] initWithDocID: docID revID: revID
+                                                                  deleted: deleted];
+    rev.sequence = sequence;
+    if (json)
+        rev.asJSON = json;
+    return rev;
 }
 
 
@@ -546,6 +750,42 @@ static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **a
         [_docIDs setObject: @(result) forKey: docID];
         return result;
     }
+}
+
+- (SInt64) _getDocNumericID: (NSString*)docID {
+    return [_fmdb longLongForQuery: @"SELECT doc_id FROM docs WHERE docid=?", docID];
+}
+
+- (SInt64) _createDocNumericID: (NSString*)docID {
+    if (![_fmdb executeUpdate: @"INSERT OR IGNORE INTO docs (docid) VALUES (?)", docID])
+        return -1;
+    if (_fmdb.changes == 0)
+        return 0;
+    return _fmdb.lastInsertRowId;
+}
+
+// Registers a docID and returns its numeric row ID in the 'docs' table.
+// On input, *ioIsNew should be YES if the docID is probably not known, NO if it's probably known.
+// On return, *ioIsNew will be YES iff the docID is newly-created (was not known before.)
+// Return value is the positive row ID of this doc, or <= 0 on error.
+- (SInt64) createOrGetDocNumericID: (NSString*)docID isNew: (BOOL*)ioIsNew {
+    NSNumber* cached = [_docIDs objectForKey: docID];
+    if (cached) {
+        *ioIsNew = NO;
+        return cached.longLongValue;
+    }
+
+    SInt64 row = *ioIsNew ? [self _createDocNumericID: docID] : [self _getDocNumericID: docID];
+    if (row < 0)
+        return row;
+    if (row == 0) {
+        *ioIsNew = !*ioIsNew;
+        row = *ioIsNew ? [self _createDocNumericID: docID] : [self _getDocNumericID: docID];
+    }
+
+    if (row > 0)
+        [_docIDs setObject: @(row) forKey: docID];
+    return row;
 }
 
 
@@ -601,7 +841,9 @@ static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **a
 
 /** Returns an array of CBL_Revisions in reverse chronological order,
     starting with the given revision. */
-- (NSArray*) getRevisionHistory: (CBL_Revision*)rev {
+- (NSArray*) getRevisionHistory: (CBL_Revision*)rev
+                   backToRevIDs: (NSSet*)ancestorRevIDs
+{
     NSString* docID = rev.docID;
     NSString* revID = rev.revID;
     Assert(revID && docID);
@@ -611,7 +853,7 @@ static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **a
         return nil;
     else if (docNumericID == 0)
         return @[];
-    
+
     CBL_FMResultSet* r = [_fmdb executeQuery: @"SELECT sequence, parent, revid, deleted, json isnull "
                                            "FROM revs WHERE doc_id=? ORDER BY sequence DESC",
                                           @(docNumericID)];
@@ -637,6 +879,8 @@ static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **a
             [history addObject: rev];
             lastSequence = [r longLongIntForColumnIndex: 1];
             if (lastSequence == 0)
+                break;
+            if ([ancestorRevIDs containsObject: revID])
                 break;
         }
     }
@@ -809,15 +1053,15 @@ static void CBLComputeFTSRank(sqlite3_context *pCtx, int nVal, sqlite3_value **a
     NSString* sql = $sprintf(@"SELECT revid FROM revs "
                               "WHERE doc_id=? and revid in (%@) and revid <= ? "
                               "ORDER BY revid DESC LIMIT 1", 
-                              joinQuotedStrings(revIDs));
+                              CBLJoinSQLQuotedStrings(revIDs));
     _fmdb.shouldCacheStatements = NO;
     NSString* ancestor = [_fmdb stringForQuery: sql, @(docNumericID), rev.revID];
     _fmdb.shouldCacheStatements = YES;
     return ancestor;
 }
-    
 
-static NSString* joinQuotedStrings(NSArray* strings) {
+
+NSString* CBLJoinSQLQuotedStrings(NSArray* strings) {
     if (strings.count == 0)
         return @"";
     NSMutableString* result = [NSMutableString stringWithString: @"'"];
@@ -849,7 +1093,7 @@ static NSString* joinQuotedStrings(NSArray* strings) {
     NSString* sql = $sprintf(@"SELECT sequence, revs.doc_id, docid, revid, deleted %@ FROM revs, docs "
                              "WHERE sequence > ? AND current=1 "
                              "AND revs.doc_id = docs.doc_id "
-                             "ORDER BY revs.doc_id, revid DESC",
+                             "ORDER BY revs.doc_id, deleted, revid DESC",
                              (includeDocs ? @", json" : @""));
     CBL_FMResultSet* r = [_fmdb executeQuery: sql, @(lastSequence)];
     if (!r)
@@ -865,16 +1109,16 @@ static NSString* joinQuotedStrings(NSArray* strings) {
                     continue;
                 lastDocID = docNumericID;
             }
-            
-            CBL_MutableRevision* rev = [[CBL_MutableRevision alloc] initWithDocID: [r stringForColumnIndex: 2]
-                                                          revID: [r stringForColumnIndex: 3]
-                                                        deleted: [r boolForColumnIndex: 4]];
+
+            NSString* docID = [r stringForColumnIndex: 2];
+            NSString* revID = [r stringForColumnIndex: 3];
+            BOOL deleted = [r boolForColumnIndex: 4];
+            CBL_MutableRevision* rev = [[CBL_MutableRevision alloc] initWithDocID: docID
+                                                                            revID: revID
+                                                                          deleted: deleted];
             rev.sequence = [r longLongIntForColumnIndex: 0];
-            if (includeDocs) {
-                [self expandStoredJSON: [r dataNoCopyForColumnIndex: 5]
-                          intoRevision: rev
-                               options: options->contentOptions];
-            }
+            if (includeDocs)
+                rev.asJSON = [r dataNoCopyForColumnIndex: 5];
             if (!filter || filter(rev))
                 [changes addRev: rev];
         }
@@ -882,7 +1126,7 @@ static NSString* joinQuotedStrings(NSArray* strings) {
     [r close];
     
     if (options->sortBySequence) {
-        [changes sortBySequence];
+        [changes sortBySequenceAscending: !options->descending];
         [changes limit: options->limit];
     }
     return changes;
@@ -897,8 +1141,8 @@ static NSString* joinQuotedStrings(NSArray* strings) {
     NSString* sql = $sprintf(@"SELECT docid, revid FROM revs, docs "
                               "WHERE revid in (%@) AND docid IN (%@) "
                               "AND revs.doc_id == docs.doc_id",
-                             joinQuotedStrings(revs.allRevIDs),
-                             joinQuotedStrings(revs.allDocIDs));
+                             CBLJoinSQLQuotedStrings(revs.allRevIDs),
+                             CBLJoinSQLQuotedStrings(revs.allDocIDs));
     _fmdb.shouldCacheStatements = NO;
     CBL_FMResultSet* r = [_fmdb executeQuery: sql];
     _fmdb.shouldCacheStatements = YES;
@@ -938,7 +1182,7 @@ static NSString* joinQuotedStrings(NSArray* strings) {
     if (options.keys) {
         if (options.keys.count == 0)
             return ^CBLQueryRow*() { return nil; };
-        [sql appendFormat: @" revs.doc_id IN (SELECT doc_id FROM docs WHERE docid IN (%@)) AND", joinQuotedStrings(options.keys)];
+        [sql appendFormat: @" revs.doc_id IN (SELECT doc_id FROM docs WHERE docid IN (%@)) AND", CBLJoinSQLQuotedStrings(options.keys)];
         cacheQuery = NO; // we've put hardcoded key strings in the query
     }
     [sql appendString: @" docs.doc_id = revs.doc_id AND current=1"];
@@ -961,6 +1205,7 @@ static NSString* joinQuotedStrings(NSArray* strings) {
     }
     if (maxKey) {
         Assert([maxKey isKindOfClass: [NSString class]]);
+        maxKey = CBLKeyForPrefixMatch(maxKey, options->prefixMatchLevel);
         [sql appendString: (inclusiveMax ? @" AND docid <= ?" :  @" AND docid < ?")];
         [args addObject: maxKey];
     }
@@ -993,20 +1238,15 @@ static NSString* joinQuotedStrings(NSArray* strings) {
             SequenceNumber sequence = [r longLongIntForColumnIndex: 3];
             BOOL deleted = includeDeletedDocs && [r boolForColumn: @"deleted"];
 
-            NSDictionary* docContents = nil;
+            CBL_Revision* docRevision = nil;
             if (includeDocs) {
                 // Fill in the document contents:
-                NSData* json = [r dataNoCopyForColumnIndex: 4];
-                CBLContentOptions contentOptions = options->content;
-                if ([r boolForColumnIndex: 5])
-                    contentOptions |= kCBLNoAttachments; // doc has no attachments
-                docContents = [self documentPropertiesFromJSON: json
-                                                         docID: docID
-                                                         revID: revID
-                                                       deleted: deleted
-                                                      sequence: sequence
-                                                       options: contentOptions];
-                Assert(docContents);
+                docRevision = [self revisionWithDocID: docID
+                                                revID: revID
+                                              deleted: deleted
+                                             sequence: sequence
+                                                 json: [r dataForColumnIndex: 4]];
+                Assert(docRevision);
             }
             
             // Iterate over following rows with the same doc_id -- these are conflicts.
@@ -1029,7 +1269,7 @@ static NSString* joinQuotedStrings(NSArray* strings) {
                                                          sequence: sequence
                                                               key: docID
                                                             value: value
-                                                    docProperties: docContents
+                                                      docRevision: docRevision
                                                           storage: nil];
             if (options.keys)
                 docs[docID] = row;
@@ -1062,7 +1302,7 @@ static NSString* joinQuotedStrings(NSArray* strings) {
                                                    sequence: 0
                                                         key: docID
                                                       value: value
-                                              docProperties: nil
+                                                docRevision: nil
                                                     storage: nil];
             }
             if (!options.filter || options.filter(change))
@@ -1078,12 +1318,11 @@ static NSString* joinQuotedStrings(NSArray* strings) {
 }
 
 
-- (NSDictionary*) documentPropertiesFromJSON: (NSData*)json
-                                       docID: (NSString*)docID
-                                       revID: (NSString*)revID
-                                     deleted: (BOOL)deleted
-                                    sequence: (SequenceNumber)sequence
-                                     options: (CBLContentOptions)options
+- (NSMutableDictionary*) documentPropertiesFromJSON: (NSData*)json
+                                              docID: (NSString*)docID
+                                              revID: (NSString*)revID
+                                            deleted: (BOOL)deleted
+                                           sequence: (SequenceNumber)sequence
 {
     CBL_MutableRevision* rev = [[CBL_MutableRevision alloc] initWithDocID: docID revID: revID
                                                                   deleted: deleted];
@@ -1101,7 +1340,10 @@ static NSString* joinQuotedStrings(NSArray* strings) {
             docProperties = $mdict();
         }
     }
-    [self extraPropertiesForRevision: rev options: options into: docProperties];
+    docProperties[@"_id"] = docID;
+    docProperties[@"_rev"] = revID;
+    if (deleted)
+        docProperties[@"_deleted"] = $true;
     return docProperties;
 }
 
@@ -1284,12 +1526,17 @@ static NSString* joinQuotedStrings(NSArray* strings) {
              allowConflict: (BOOL)allowConflict
            validationBlock: (CBL_StorageValidationBlock)validationBlock
                     status: (CBLStatus*)outStatus
+                     error: (NSError**)outError
 {
+    if (outError)
+        *outError = nil;
+
     __block NSData* json = nil;
     if (properties) {
         json = [CBL_Revision asCanonicalJSON: properties error: NULL];
         if (!json) {
             *outStatus = kCBLStatusBadJSON;
+            CBLStatusToOutNSError(*outStatus, outError);
             return nil;
         }
     } else {
@@ -1297,13 +1544,13 @@ static NSString* joinQuotedStrings(NSArray* strings) {
     }
 
     __block CBL_MutableRevision* newRev = nil;
-    __block CBL_Revision* winningRev = nil;
+    __block NSString* winningRevID = nil;
     __block BOOL inConflict = NO;
 
-    *outStatus = [self inTransaction: ^CBLStatus {
+    *outStatus = [self inOuterTransaction: ^CBLStatus {
         // Remember, this block may be called multiple times if I have to retry the transaction.
         newRev = nil;
-        winningRev = nil;
+        winningRevID = nil;
         inConflict = NO;
         NSString* prevRevID = inPrevRevID;
         NSString* docID = inDocID;
@@ -1311,11 +1558,20 @@ static NSString* joinQuotedStrings(NSArray* strings) {
         //// PART I: In which are performed lookups and validations prior to the insert...
 
         // Get the doc's numeric ID (doc_id) and its current winning revision:
-        SInt64 docNumericID = docID ? [self getDocNumericID: docID] : 0;
+        BOOL isNewDoc = (prevRevID == nil);
+        SInt64 docNumericID;
+        if (docID) {
+            docNumericID = [self createOrGetDocNumericID: docID isNew: &isNewDoc];
+            if (docNumericID <= 0)
+                return self.lastDbError;
+        } else {
+            docNumericID = 0;
+            isNewDoc = YES;
+        }
         BOOL oldWinnerWasDeletion = NO;
         BOOL wasConflicted = NO;
         NSString* oldWinningRevID = nil;
-        if (docNumericID > 0) {
+        if (!isNewDoc) {
             // Look up which rev is the winner, before this insertion
             //OPT: This rev ID could be cached in the 'docs' row
             CBLStatus status;
@@ -1330,7 +1586,7 @@ static NSString* joinQuotedStrings(NSArray* strings) {
         SequenceNumber parentSequence = 0;
         if (prevRevID) {
             // Replacing: make sure given prevRevID is current & find its sequence number:
-            if (docNumericID <= 0)
+            if (isNewDoc)
                 return kCBLStatusNotFound;
             parentSequence = [self getSequenceOfDocument: docNumericID revision: prevRevID
                                              onlyCurrent: !allowConflict];
@@ -1352,27 +1608,20 @@ static NSString* joinQuotedStrings(NSArray* strings) {
             
             if (docID) {
                 // Inserting first revision, with docID given (PUT):
-                if (docNumericID <= 0) {
-                    // Doc ID doesn't exist at all; create it:
-                    docNumericID = [self insertDocumentID: docID];
-                    if (docNumericID <= 0)
-                        return self.lastDbError;
-                } else {
-                    // Doc ID exists; check whether current winning revision is deleted:
-                    if (oldWinnerWasDeletion) {
-                        prevRevID = oldWinningRevID;
-                        parentSequence = [self getSequenceOfDocument: docNumericID
-                                                            revision: prevRevID
-                                                         onlyCurrent: NO];
-                    } else if (oldWinningRevID) {
-                        // The current winning revision is not deleted, so this is a conflict
-                        return kCBLStatusConflict;
-                    }
+                // Check whether current winning revision is deleted:
+                if (oldWinnerWasDeletion) {
+                    prevRevID = oldWinningRevID;
+                    parentSequence = [self getSequenceOfDocument: docNumericID
+                                                        revision: prevRevID
+                                                     onlyCurrent: NO];
+                } else if (oldWinningRevID) {
+                    // The current winning revision is not deleted, so this is a conflict
+                    return kCBLStatusConflict;
                 }
             } else {
                 // Inserting first revision, with no docID given (POST): generate a unique docID:
                 docID = CBLCreateUUID();
-                docNumericID = [self insertDocumentID: docID];
+                docNumericID = [self createOrGetDocNumericID: docID isNew: &isNewDoc];
                 if (docNumericID <= 0)
                     return self.lastDbError;
             }
@@ -1409,7 +1658,7 @@ static NSString* joinQuotedStrings(NSArray* strings) {
                                                         revID: prevRevID
                                                       deleted: NO];
             }
-            CBLStatus status = validationBlock(newRev, prevRev, prevRevID);
+            CBLStatus status = validationBlock(newRev, prevRev, prevRevID, outError);
             if (CBLStatusIsError(status))
                 return status;
         }
@@ -1427,7 +1676,8 @@ static NSString* joinQuotedStrings(NSArray* strings) {
                                         parentSequence: parentSequence
                                                current: YES
                                         hasAttachments: (properties.cbl_attachments != nil)
-                                                  JSON: json];
+                                                  JSON: json
+                                               docType: properties[@"type"]];
         if (!sequence) {
             // The insert failed. If it was due to a constraint violation, that means a revision
             // already exists with identical contents and the same parent rev. We can ignore this
@@ -1441,16 +1691,19 @@ static NSString* joinQuotedStrings(NSArray* strings) {
         
         // Make replaced rev non-current:
         if (parentSequence > 0) {
-            if (![_fmdb executeUpdate: @"UPDATE revs SET current=0 WHERE sequence=?",
-                                       @(parentSequence)])
-                return self.lastDbError;
+            if (![_fmdb executeUpdate: @"UPDATE revs SET current=0, doc_type=null WHERE sequence=?",
+                                       @(parentSequence)]) {
+                CBLStatus status = self.lastDbError;
+                [_fmdb executeUpdate: @"DELETE FROM revs WHERE sequence=?", @(sequence)];
+                return status;
+            }
         }
 
         if (!sequence)
             return kCBLStatusOK;  // duplicate rev; see above
 
         // Figure out what the new winning rev ID is:
-            winningRev = [self winnerWithDocID: docNumericID
+            winningRevID = [self winnerWithDocID: docNumericID
                                  oldWinner: oldWinningRevID oldDeleted: oldWinnerWasDeletion
                                         newRev: newRev];
 
@@ -1458,14 +1711,19 @@ static NSString* joinQuotedStrings(NSArray* strings) {
         return deleting ? kCBLStatusOK : kCBLStatusCreated;
     }];
     
-    if (CBLStatusIsError(*outStatus)) 
+    if (CBLStatusIsError(*outStatus)) {
+        if (outError && !*outError)
+            CBLStatusToOutNSError(*outStatus, outError);
         return nil;
+    }
     
     //// EPILOGUE: A change notification is sent...
-    [_delegate databaseStorageChanged: [[CBLDatabaseChange alloc] initWithAddedRevision: newRev
-                                                                        winningRevision: winningRev
-                                                                             inConflict: inConflict
-                                                                                 source: nil]];
+    if (newRev.sequenceIfKnown != 0) {
+        [_delegate databaseStorageChanged: [[CBLDatabaseChange alloc] initWithAddedRevision: newRev
+                                                                  winningRevisionID: winningRevID
+                                                                         inConflict: inConflict
+                                                                             source: nil]];
+    }
     return newRev;
 }
 
@@ -1474,25 +1732,35 @@ static NSString* joinQuotedStrings(NSArray* strings) {
           revisionHistory: (NSArray*)history
           validationBlock: (CBL_StorageValidationBlock)validationBlock
                    source: (NSURL*)source
+                    error: (NSError**)outError
 {
+    if (outError)
+        *outError = nil;
+
     CBL_MutableRevision* rev = inRev.mutableCopy;
     rev.sequence = 0;
     NSString* docID = rev.docID;
     
-    __block CBL_Revision* winningRev = nil;
+    __block NSString* winningRevID = nil;
     __block BOOL inConflict = NO;
     CBLStatus status = [self inTransaction: ^CBLStatus {
         // First look up the document's row-id and all locally-known revisions of it:
-        CBL_RevisionList* localRevs = nil;
+        NSMutableDictionary* localRevs = nil;
         NSString* oldWinningRevID = nil;
         BOOL oldWinnerWasDeletion = NO;
-        SInt64 docNumericID = [self getDocNumericID: docID];
-        if (docNumericID > 0) {
-            localRevs = [self getAllRevisionsOfDocumentID: docID
-                                                numericID: docNumericID
-                                              onlyCurrent: NO];
-            if (!localRevs)
+        BOOL isNewDoc = (history.count == 1);
+        SInt64 docNumericID = [self createOrGetDocNumericID: docID isNew: &isNewDoc];
+        if (docNumericID <= 0)
+            return self.lastDbError;
+        if (!isNewDoc) {
+            CBL_RevisionList* localRevsList = [self getAllRevisionsOfDocumentID: docID
+                                                                      numericID: docNumericID
+                                                                    onlyCurrent: NO];
+            if (!localRevsList)
                 return self.lastDbError;
+            localRevs = [[NSMutableDictionary alloc] initWithCapacity: localRevsList.count];
+            for (CBL_Revision* rev in localRevsList)
+                localRevs[rev.revID] = rev;
 
             // Look up which rev is the winner, before this insertion
             CBLStatus tempStatus;
@@ -1502,22 +1770,18 @@ static NSString* joinQuotedStrings(NSArray* strings) {
                                                         status: &tempStatus];
             if (CBLStatusIsError(tempStatus))
                 return tempStatus;
-        } else {
-            docNumericID = [self insertDocumentID: docID];
-            if (docNumericID <= 0)
-                return self.lastDbError;
         }
 
         // Validate against the latest common ancestor:
         if (validationBlock) {
             CBL_Revision* oldRev = nil;
             for (NSUInteger i = 1; i<history.count; ++i) {
-                oldRev = [localRevs revWithDocID: docID revID: history[i]];
+                oldRev = localRevs[history[i]];
                 if (oldRev)
                     break;
             }
             NSString* parentRevID = (history.count > 1) ? history[1] : nil;
-            CBLStatus status = validationBlock(rev, oldRev, parentRevID);
+            CBLStatus status = validationBlock(rev, oldRev, parentRevID, outError);
             if (CBLStatusIsError(status))
                 return status;
         }
@@ -1529,7 +1793,7 @@ static NSString* joinQuotedStrings(NSArray* strings) {
         SequenceNumber localParentSequence = 0;
         for (NSInteger i = history.count - 1; i>=0; --i) {
             NSString* revID = history[i];
-            CBL_Revision* localRev = [localRevs revWithDocID: docID revID: revID];
+            CBL_Revision* localRev = localRevs[revID];
             if (localRev) {
                 // This revision is known locally. Remember its sequence as the parent of the next one:
                 sequence = localRev.sequence;
@@ -1540,6 +1804,7 @@ static NSString* joinQuotedStrings(NSArray* strings) {
                 // This revision isn't known, so add it:
                 CBL_MutableRevision* newRev;
                 NSData* json = nil;
+                NSString* docType = nil;
                 BOOL current = NO;
                 if (i==0) {
                     // Hey, this is the leaf revision we're inserting:
@@ -1547,6 +1812,7 @@ static NSString* joinQuotedStrings(NSArray* strings) {
                     json = [self encodeDocumentJSON: rev];
                     if (!json)
                         return kCBLStatusBadJSON;
+                    docType = rev[@"type"];
                     current = YES;
                 } else {
                     // It's an intermediate parent, so insert a stub:
@@ -1560,7 +1826,8 @@ static NSString* joinQuotedStrings(NSArray* strings) {
                                  parentSequence: sequence
                                         current: current 
                                  hasAttachments: (newRev.attachments != nil)
-                                           JSON: json];
+                                           JSON: json
+                                        docType: docType];
                 if (sequence <= 0)
                     return self.lastDbError;
             }
@@ -1571,7 +1838,8 @@ static NSString* joinQuotedStrings(NSArray* strings) {
 
         // Mark the latest local rev as no longer current:
         if (localParentSequence > 0) {
-            if (![_fmdb executeUpdate: @"UPDATE revs SET current=0 WHERE sequence=? AND current!=0",
+            if (![_fmdb executeUpdate: @"UPDATE revs SET current=0, doc_type=null"
+                                        " WHERE sequence=? AND current!=0",
                   @(localParentSequence)])
                 return self.lastDbError;
             if (_fmdb.changes == 0)
@@ -1579,7 +1847,7 @@ static NSString* joinQuotedStrings(NSArray* strings) {
         }
 
             // Figure out what the new winning rev ID is:
-            winningRev = [self winnerWithDocID: docNumericID
+            winningRevID = [self winnerWithDocID: docNumericID
                                      oldWinner: oldWinningRevID
                                     oldDeleted: oldWinnerWasDeletion
                                         newRev: rev];
@@ -1587,24 +1855,17 @@ static NSString* joinQuotedStrings(NSArray* strings) {
         return kCBLStatusCreated;
     }];
 
-    if (!CBLStatusIsError(status)) {
+    if (status == kCBLStatusCreated) {
         [_delegate databaseStorageChanged: [[CBLDatabaseChange alloc] initWithAddedRevision: rev
-                                                                        winningRevision: winningRev
-                                                                             inConflict: inConflict
-                                                                                 source: source]];
+                                                              winningRevisionID: winningRevID
+                                                                     inConflict: inConflict
+                                                                         source: source]];
+    } else if (CBLStatusIsError(status)) {
+        if (outError && !*outError)
+            CBLStatusToOutNSError(status, outError);
     }
+
     return status;
-}
-
-
-/** Adds a new document ID to the 'docs' table. */
-- (SInt64) insertDocumentID: (NSString*)docID {
-    if (![_fmdb executeUpdate: @"INSERT INTO docs (docid) VALUES (?)", docID])
-        return -1;
-    SInt64 row = _fmdb.lastInsertRowId;
-    Assert(![_docIDs objectForKey: docID]);
-    [_docIDs setObject: @(row) forKey: docID];
-    return row;
 }
 
 
@@ -1615,17 +1876,19 @@ static NSString* joinQuotedStrings(NSArray* strings) {
                           current: (BOOL)current
                    hasAttachments: (BOOL)hasAttachments
                              JSON: (NSData*)json
+                          docType: (NSString*)docType
 {
     if (![_fmdb executeUpdate: @"INSERT INTO revs (doc_id, revid, parent, current, deleted, "
-          "no_attachments, json) "
-          "VALUES (?, ?, ?, ?, ?, ?, ?)",
+          "no_attachments, json, doc_type) "
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
           @(docNumericID),
           rev.revID,
           (parentSequence ? @(parentSequence) : nil ),
           @(current),
           @(rev.deleted),
           @(!hasAttachments),
-          json])
+          json,
+          docType])
         return 0;
     return rev.sequence = _fmdb.lastInsertRowId;
 }
@@ -1667,20 +1930,20 @@ static NSString* joinQuotedStrings(NSArray* strings) {
 }
 
 
-- (CBL_Revision*) winnerWithDocID: (SInt64)docNumericID
-                        oldWinner: (NSString*)oldWinningRevID
-                       oldDeleted: (BOOL)oldWinnerWasDeletion
-                           newRev: (CBL_Revision*)newRev
+- (NSString*) winnerWithDocID: (SInt64)docNumericID
+                    oldWinner: (NSString*)oldWinningRevID
+                   oldDeleted: (BOOL)oldWinnerWasDeletion
+                       newRev: (CBL_Revision*)newRev
 {
-    if (!oldWinningRevID)
-        return newRev;
     NSString* newRevID = newRev.revID;
+    if (!oldWinningRevID)
+        return newRevID;
     if (!newRev.deleted) {
         if (oldWinnerWasDeletion || CBLCompareRevIDs(newRevID, oldWinningRevID) > 0)
-            return newRev;   // this is now the winning live revision
+            return newRevID;   // this is now the winning live revision
     } else if (oldWinnerWasDeletion) {
         if (CBLCompareRevIDs(newRevID, oldWinningRevID) > 0)
-            return newRev;  // doc still deleted, but this beats previous deletion rev
+            return newRevID;  // doc still deleted, but this beats previous deletion rev
     } else {
         // Doc was alive. How does this deletion affect the winning rev ID?
         BOOL deleted;
@@ -1690,16 +1953,8 @@ static NSString* joinQuotedStrings(NSArray* strings) {
                                                        isConflict: NULL
                                                            status: &status];
         AssertEq(status, kCBLStatusOK);
-        if (!$equal(winningRevID, oldWinningRevID)) {
-            if ($equal(winningRevID, newRev.revID))
-                return newRev;
-            else {
-                CBL_Revision* winningRev = [[CBL_Revision alloc] initWithDocID: newRev.docID
-                                                                         revID: winningRevID
-                                                                       deleted: NO];
-                return winningRev;
-            }
-        }
+        if (!$equal(winningRevID, oldWinningRevID))
+            return winningRevID;
     }
     return nil; // no change
 }
@@ -1708,36 +1963,101 @@ static NSString* joinQuotedStrings(NSArray* strings) {
 #pragma mark - HOUSEKEEPING:
 
 
+- (void) optimizeSQLIndexes {
+    SequenceNumber curSequence = self.lastSequence;
+    if (curSequence > 0) {
+        SequenceNumber lastOptimized = [[self infoForKey: @"last_optimized"] longLongValue];
+        if (lastOptimized <= curSequence/10) {
+            [self inTransaction:^CBLStatus{
+                LogTo(CBLDatabase, @"%@: Optimizing SQL indexes (curSeq=%lld, last run at %lld)",
+                      self, curSequence, lastOptimized);
+                [_fmdb executeUpdate: @"ANALYZE"];
+                [_fmdb executeUpdate: @"ANALYZE sqlite_master"];
+                [_fmdb clearCachedStatements];
+                [self setInfo: $sprintf(@"%lld", curSequence) forKey: @"last_optimized"];
+                return kCBLStatusOK;
+            }];
+        }
+    }
+}
+
+
 - (BOOL) compact: (NSError**)outError {
-    // Can't delete any rows because that would lose revision tree history.
-    // But we can remove the JSON of non-current revisions, which is most of the space.
+    // Start off by pruning each revision tree's depth:
+    NSUInteger nPruned;
+    CBLStatus status = [self pruneRevsToMaxDepth: _maxRevTreeDepth numberPruned: &nPruned];
+    if (status != kCBLStatusOK)
+        return CBLStatusToOutNSError(status, outError);
+
+    // Remove the JSON of non-current revisions, which is most of the space.
     Log(@"CBLDatabase: Deleting JSON of old revisions...");
-    if (![_fmdb executeUpdate: @"UPDATE revs SET json=null, no_attachments=1 WHERE current=0"])
-        return ReturnNSErrorFromCBLStatus(self.lastDbError, outError);
+    if (![_fmdb executeUpdate: @"UPDATE revs SET json=null, doc_type=null, no_attachments=1"
+                                " WHERE current=0"])
+        return CBLStatusToOutNSError(self.lastDbError, outError);
     Log(@"    ... deleted %d revisions", _fmdb.changes);
 
     Log(@"Flushing SQLite WAL...");
     if (![_fmdb executeUpdate: @"PRAGMA wal_checkpoint(RESTART)"])
-        return ReturnNSErrorFromCBLStatus(self.lastDbError, outError);
+        return CBLStatusToOutNSError(self.lastDbError, outError);
 
     Log(@"Vacuuming SQLite database...");
     if (![_fmdb executeUpdate: @"VACUUM"])
-        return ReturnNSErrorFromCBLStatus(self.lastDbError, outError);
+        return CBLStatusToOutNSError(self.lastDbError, outError);
 
 //    Log(@"Closing and re-opening database...");
 //    [_fmdb close];
 //    if (![self openFMDB: nil])
-//        return ReturnNSErrorFromCBLStatus(self.lastDbError, outError);
+//        return CBLStatusToOutNSError(self.lastDbError, outError);
 
     Log(@"...Finished database compaction.");
     return YES;
 }
 
 
+- (CBLStatus) pruneRevsToMaxDepth: (NSUInteger)maxDepth numberPruned: (NSUInteger*)outPruned {
+    // TODO: This implementation is a bit simplistic. It won't do quite the right thing in
+    // histories with branches, if one branch stops much earlier than another. The shorter branch
+    // will be deleted entirely except for its leaf revision. A more accurate pruning
+    // would require an expensive full tree traversal. Hopefully this way is good enough.
+    if (maxDepth == 0)
+        maxDepth = self.maxRevTreeDepth;
+
+    Log(@"CBLDatabase: Pruning revisions to max depth %ld...", (unsigned long)maxDepth);
+    *outPruned = 0;
+    // First find which docs need pruning, and by how much:
+    NSMutableDictionary* toPrune = $mdict();
+    NSString* sql = @"SELECT doc_id, MIN(revid), MAX(revid) FROM revs GROUP BY doc_id";
+    CBL_FMResultSet* r = [_fmdb executeQuery: sql];
+    while ([r next]) {
+        UInt64 docNumericID = [r longLongIntForColumnIndex: 0];
+        unsigned minGen = [CBL_Revision generationFromRevID: [r stringForColumnIndex: 1]];
+        unsigned maxGen = [CBL_Revision generationFromRevID: [r stringForColumnIndex: 2]];
+        if ((maxGen - minGen + 1) > maxDepth)
+            toPrune[@(docNumericID)] = @(maxGen - maxDepth);
+    }
+    [r close];
+
+    if (toPrune.count == 0)
+        return kCBLStatusOK;
+
+    // Now prune:
+    return [self inTransaction:^CBLStatus{
+        for (id docNumericID in toPrune) {
+            NSString* minIDToKeep = $sprintf(@"%d-", [toPrune[docNumericID] intValue] + 1);
+            if (![_fmdb executeUpdate: @"DELETE FROM revs WHERE doc_id=? AND revid < ? AND current=0",
+                                       docNumericID, minIDToKeep])
+                return self.lastDbError;
+            *outPruned += _fmdb.changes;
+        }
+        return kCBLStatusOK;
+    }];
+}
+
+
 - (NSSet*) findAllAttachmentKeys: (NSError**)outError {
     CBL_FMResultSet* r = [_fmdb executeQuery: @"SELECT json FROM revs WHERE no_attachments != 1"];
     if (!r) {
-        ReturnNSErrorFromCBLStatus(self.lastDbStatus, outError);
+        CBLStatusToOutNSError(self.lastDbStatus, outError);
         return nil;
     }
     NSMutableSet* allKeys = [NSMutableSet set];

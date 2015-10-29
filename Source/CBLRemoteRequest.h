@@ -10,6 +10,8 @@
 @protocol CBLAuthorizer, CBLRemoteRequestDelegate;
 
 
+@class CBLCookieStorage;
+
 /** The signature of the completion block called by a CBLRemoteRequest.
     @param result  On success, a 'result' object; by default this is the CBLRemoteRequest iself, but subclasses may return something else. On failure, this will likely be nil.
     @param error  The error, if any, else nil. */
@@ -20,15 +22,12 @@ void CBLWarnUntrustedCert(NSString* host, SecTrustRef trust);
 
 
 /** Asynchronous HTTP request; a fairly simple wrapper around NSURLConnection that calls a completion block when ready. */
-@interface CBLRemoteRequest : NSObject <NSURLConnectionDelegate
-#if TARGET_OS_IPHONE || defined(__MAC_10_8)
-                                                              , NSURLConnectionDataDelegate
-#endif
-                                                                                           >
+@interface CBLRemoteRequest : NSObject <NSURLConnectionDelegate, NSURLConnectionDataDelegate>
 {
     @protected
     NSMutableURLRequest* _request;
     id<CBLAuthorizer> _authorizer;
+    CBLCookieStorage* _cookieStorage;
     id<CBLRemoteRequestDelegate> _delegate;
     CBLRemoteRequestCompletionBlock _onCompletion;
     NSURLConnection* _connection;
@@ -37,6 +36,7 @@ void CBLWarnUntrustedCert(NSString* host, SecTrustRef trust);
     UInt8 _retryCount;
     bool _dontLog404;
     bool _challenged;
+    bool _autoRetry;
 }
 
 /** Creates a request; call -start to send it on its way. */
@@ -49,6 +49,8 @@ void CBLWarnUntrustedCert(NSString* host, SecTrustRef trust);
 @property NSTimeInterval timeoutInterval;
 @property (strong, nonatomic) id<CBLAuthorizer> authorizer;
 @property (strong, nonatomic) id<CBLRemoteRequestDelegate> delegate;
+@property (strong, nonatomic) CBLCookieStorage* cookieStorage;
+@property (nonatomic) bool autoRetry;   // Default value is YES
 
 /** Applies GZip compression to the request body if appropriate. */
 - (BOOL) compressBody;
@@ -72,9 +74,11 @@ void CBLWarnUntrustedCert(NSString* host, SecTrustRef trust);
 - (void) clearConnection;
 - (void) cancelWithStatus: (int)status;
 - (void) respondWithResult: (id)result error: (NSError*)error;
+- (BOOL) retry;
 
-// The value to use for the User-Agent HTTP header.
-+ (NSString*) userAgentHeader;
+#if DEBUG
+@property BOOL debugAlwaysTrust;    // For unit tests only!
+#endif
 
 @end
 

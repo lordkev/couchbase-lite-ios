@@ -22,7 +22,7 @@
 #import "CBL_Shared.h"
 #import "CBLInternal.h"
 #import "CouchbaseLitePrivate.h"
-#import "GTMNSData+zlib.h"
+#import "CBLGZip.h"
 
 
 static NSDictionary* userProperties(NSDictionary* dict) {
@@ -35,11 +35,6 @@ static NSDictionary* userProperties(NSDictionary* dict) {
 }
 
 
-@interface CBLForestBridge : NSObject
-+ (NSDictionary*) makeRevisionHistoryDict: (NSArray*)history; // exposed for testing only
-@end
-
-
 @interface DatabaseInternal_Tests : CBLTestCaseWithDB
 @end
 
@@ -50,11 +45,14 @@ static NSDictionary* userProperties(NSDictionary* dict) {
 - (CBL_Revision*) putDoc: (NSDictionary*) props {
     CBL_Revision* rev = [[CBL_Revision alloc] initWithProperties: props];
     CBLStatus status;
+    NSError* error;
     CBL_Revision* result = [db putRevision: [rev mutableCopy]
-                           prevRevisionID: props[@"_rev"]
-                            allowConflict: NO
-                                   status: &status];
-    Assert(status < 300, @"Status %d from putRevision:", status);
+                            prevRevisionID: props[@"_rev"]
+                             allowConflict: NO
+                                    status: &status
+                                     error: &error];
+    Assert(status < 300, @"Status %d from putRevision: (reason: %@)",
+           status, error.localizedFailureReason);
     Assert(result.revID != nil);
     return result;
 }
@@ -83,16 +81,19 @@ static NSDictionary* userProperties(NSDictionary* dict) {
 
     // Get a nonexistent document:
     CBLStatus status;
-    AssertNil([db getDocumentWithID: @"nonexistent" revisionID: nil options: 0 status: &status]);
+    AssertNil([db getDocumentWithID: @"nonexistent" revisionID: nil withBody: YES status: &status]);
     AssertEq(status, kCBLStatusNotFound);
     
     // Create a document:
+    NSError* error;
     NSMutableDictionary* props = $mdict({@"foo", @1}, {@"bar", $false});
     CBL_Body* doc = [[CBL_Body alloc] initWithProperties: props];
     CBL_Revision* rev1 = [[CBL_Revision alloc] initWithBody: doc];
     Assert(rev1);
-    rev1 = [db putRevision: [rev1 mutableCopy] prevRevisionID: nil allowConflict: NO status: &status];
+    rev1 = [db putRevision: [rev1 mutableCopy] prevRevisionID: nil allowConflict: NO
+                    status: &status error: &error];
     AssertEq(status, kCBLStatusCreated);
+    AssertNil(error);
     Log(@"Created: %@", rev1);
     Assert(rev1.docID.length >= 10);
     Assert([rev1.revID hasPrefix: @"1-"]);
@@ -108,8 +109,10 @@ static NSDictionary* userProperties(NSDictionary* dict) {
     doc = [CBL_Body bodyWithProperties: props];
     CBL_Revision* rev2 = [[CBL_Revision alloc] initWithBody: doc];
     CBL_Revision* rev2Input = rev2;
-    rev2 = [db putRevision: [rev2 mutableCopy] prevRevisionID: rev1.revID allowConflict: NO status: &status];
+    rev2 = [db putRevision: [rev2 mutableCopy] prevRevisionID: rev1.revID allowConflict: NO
+                    status: &status error: &error];
     AssertEq(status, kCBLStatusCreated);
+    AssertNil(error);
     Log(@"Updated: %@", rev2);
     AssertEqual(rev2.docID, rev1.docID);
     Assert([rev2.revID hasPrefix: @"2-"]);
@@ -120,8 +123,10 @@ static NSDictionary* userProperties(NSDictionary* dict) {
     AssertEqual(userProperties(readRev.properties), userProperties(doc.properties));
     
     // Try to update the first rev, which should fail:
-    AssertNil([db putRevision: [rev2Input mutableCopy] prevRevisionID: rev1.revID allowConflict: NO status: &status]);
+    AssertNil([db putRevision: [rev2Input mutableCopy] prevRevisionID: rev1.revID allowConflict: NO
+                       status: &status error: &error]);
     AssertEq(status, kCBLStatusConflict);
+    AssertEq(error.code, kCBLStatusConflict);
 
     // Check the changes feed, with and without filters:
     CBL_RevisionList* changes = [db changesSinceSequence: 0 options: NULL filter: NULL params: nil status: &status];
@@ -142,11 +147,17 @@ static NSDictionary* userProperties(NSDictionary* dict) {
     AssertEq(changes.count, 0u);
         
     // Delete it:
+    error = nil;
     CBL_Revision* revD = [[CBL_Revision alloc] initWithDocID: rev2.docID revID: nil deleted: YES];
-    AssertEqual([db putRevision: [revD mutableCopy] prevRevisionID: nil allowConflict: NO status: &status], nil);
+    AssertEqual([db putRevision: [revD mutableCopy] prevRevisionID: nil allowConflict: NO
+                         status: &status error: &error], nil);
     AssertEq(status, kCBLStatusConflict);
-    revD = [db putRevision: [revD mutableCopy] prevRevisionID: rev2.revID allowConflict: NO status: &status];
+
+    error = nil;
+    revD = [db putRevision: [revD mutableCopy] prevRevisionID: rev2.revID allowConflict: NO
+                    status: &status error: &error];
     AssertEq(status, kCBLStatusOK);
+    AssertNil(error);
     AssertEqual(revD.docID, rev2.docID);
     Assert([revD.revID hasPrefix: @"3-"]);
 
@@ -157,9 +168,12 @@ static NSDictionary* userProperties(NSDictionary* dict) {
     AssertEqual(readRev.revID, revD.revID);
 
     // Delete nonexistent doc:
+    error = nil;
     CBL_Revision* revFake = [[CBL_Revision alloc] initWithDocID: @"fake" revID: nil deleted: YES];
-    [db putRevision: [revFake mutableCopy] prevRevisionID: nil allowConflict: NO status: &status];
+    [db putRevision: [revFake mutableCopy] prevRevisionID: nil allowConflict: NO
+             status: &status error: &error];
     AssertEq(status, kCBLStatusNotFound);
+    AssertEq(error.code, kCBLStatusNotFound);
 
     // Read it back (should fail):
     readRev = [db getDocumentWithID: revD.docID revisionID: nil];
@@ -170,7 +184,7 @@ static NSDictionary* userProperties(NSDictionary* dict) {
     Log(@"Changes = %@", changes);
     AssertEq(changes.count, 1u);
     
-    NSArray* history = [db.storage getRevisionHistory: revD];
+    NSArray* history = [db getRevisionHistory: revD backToRevIDs: nil];
     Log(@"History = %@", history);
     AssertEqual(history, (@[revD, rev2, rev1]));
 
@@ -178,10 +192,12 @@ static NSDictionary* userProperties(NSDictionary* dict) {
     NSString* revDSuffix = [revD.revID substringFromIndex: 2];
     NSString* rev2Suffix = [rev2.revID substringFromIndex: 2];
     NSString* rev1Suffix = [rev1.revID substringFromIndex: 2];
-    AssertEqual(([db.storage getRevisionHistoryDict: revD startingFromAnyOf: @[@"??", rev2.revID]]),
+    history = [db getRevisionHistory: revD backToRevIDs: @[@"??", rev2.revID]];
+    AssertEqual([CBLDatabase makeRevisionHistoryDict: history],
                  (@{@"ids": @[revDSuffix, rev2Suffix],
                     @"start": @3}));
-    AssertEqual(([db.storage getRevisionHistoryDict: revD startingFromAnyOf: nil]),
+    history = [db getRevisionHistory: revD backToRevIDs: nil];
+    AssertEqual([CBLDatabase makeRevisionHistoryDict: history],
                  (@{@"ids": @[revDSuffix, rev2Suffix, rev1Suffix],
                     @"start": @3}));
 
@@ -191,7 +207,7 @@ static NSDictionary* userProperties(NSDictionary* dict) {
     AssertEqual(userProperties(readRev.properties), userProperties(rev1.properties));
 
     // Compact the database:
-    NSError* error;
+    error = nil;
     Assert([db compact: &error]);
 
     // Make sure old rev is missing:
@@ -285,20 +301,25 @@ static CBL_Revision* revBySettingProperties(CBL_Revision* rev, NSDictionary* pro
     NSMutableDictionary* props = $mdict({@"name", @"Zaphod Beeblebrox"}, {@"towel", @"velvet"});
     CBL_Revision* rev = [[CBL_Revision alloc] initWithProperties: props];
     CBLStatus status;
+    NSError* error;
     validationCalled = NO;
     expectedParentRevID = nil;
-    rev = [db putRevision: [rev mutableCopy] prevRevisionID: nil allowConflict: NO status: &status];
+    rev = [db putRevision: [rev mutableCopy] prevRevisionID: nil allowConflict: NO
+                   status: &status error: &error];
     Assert(validationCalled);
     AssertEq(status, kCBLStatusCreated);
+    AssertNil(error);
 
     // PUT a valid update:
     props[@"head_count"] = @3;
     rev = revBySettingProperties(rev, props);
     validationCalled = NO;
     expectedParentRevID = rev.revID;
-    rev = [db putRevision: [rev mutableCopy] prevRevisionID: rev.revID allowConflict: NO status: &status];
+    rev = [db putRevision: [rev mutableCopy] prevRevisionID: rev.revID allowConflict: NO
+                   status: &status error: &error];
     Assert(validationCalled);
     AssertEq(status, kCBLStatusCreated);
+    AssertNil(error);
 
     // PUT an invalid update:
     [props removeObjectForKey: @"towel"];
@@ -306,46 +327,64 @@ static CBL_Revision* revBySettingProperties(CBL_Revision* rev, NSDictionary* pro
     validationCalled = NO;
     expectedParentRevID = rev.revID;
 #pragma unused(rev)
-    rev = [db putRevision: [rev mutableCopy] prevRevisionID: rev.revID allowConflict: NO status: &status];
+    rev = [db putRevision: [rev mutableCopy] prevRevisionID: rev.revID allowConflict: NO
+                   status: &status error: &error];
     Assert(validationCalled);
     AssertEq(status, kCBLStatusForbidden);
+    AssertEq(error.code, kCBLStatusForbidden);
+    AssertEqual(error.localizedDescription, @"403 Where's your towel?");
+
 
     // POST an invalid new document:
     props = $mdict({@"name", @"Vogon"}, {@"poetry", $true});
     rev = [[CBL_Revision alloc] initWithProperties: props];
     validationCalled = NO;
     expectedParentRevID = nil;
-    rev = [db putRevision: [rev mutableCopy] prevRevisionID: nil allowConflict: NO status: &status];
+    error = nil;
+    rev = [db putRevision: [rev mutableCopy] prevRevisionID: nil allowConflict: NO
+                   status: &status error: &error];
     Assert(validationCalled);
     AssertEq(status, kCBLStatusForbidden);
+    AssertEq(error.code, kCBLStatusForbidden);
+    AssertEqual(error.localizedDescription, @"403 Where's your towel?");
 
     // PUT a valid new document with an ID:
     props = $mdict({@"_id", @"ford"}, {@"name", @"Ford Prefect"}, {@"towel", @"terrycloth"});
     rev = [[CBL_Revision alloc] initWithProperties: props];
     validationCalled = NO;
-    rev = [db putRevision: [rev mutableCopy] prevRevisionID: nil allowConflict: NO status: &status];
+    error = nil;
+    rev = [db putRevision: [rev mutableCopy] prevRevisionID: nil allowConflict: NO
+                   status: &status error: &error];
     Assert(validationCalled);
     expectedParentRevID = nil;
     AssertEq(status, kCBLStatusCreated);
     AssertEqual(rev.docID, @"ford");
+    AssertNil(error);
     
     // DELETE a document:
     rev = [[CBL_Revision alloc] initWithDocID: rev.docID revID: rev.revID deleted: YES];
     Assert(rev.deleted);
     validationCalled = NO;
     expectedParentRevID = rev.revID;
-    rev = [db putRevision: [rev mutableCopy] prevRevisionID: rev.revID allowConflict: NO status: &status];
+    error = nil;
+    rev = [db putRevision: [rev mutableCopy] prevRevisionID: rev.revID allowConflict: NO
+                   status: &status error: &error];
     AssertEq(status, kCBLStatusOK);
     Assert(validationCalled);
+    AssertNil(error);
 
     // PUT an invalid new document:
     props = $mdict({@"_id", @"petunias"}, {@"name", @"Pot of Petunias"});
     rev = [[CBL_Revision alloc] initWithProperties: props];
     validationCalled = NO;
     expectedParentRevID = nil;
-    rev = [db putRevision: [rev mutableCopy] prevRevisionID: nil allowConflict: NO status: &status];
+    error = nil;
+    rev = [db putRevision: [rev mutableCopy] prevRevisionID: nil allowConflict: NO
+                   status: &status error: &error];
     Assert(validationCalled);
     AssertEq(status, kCBLStatusForbidden);
+    AssertEq(error.code, kCBLStatusForbidden);
+    AssertEqual(error.localizedDescription, @"403 Where's your towel?");
 }
 
 
@@ -357,7 +396,7 @@ static CBL_Revision* revBySettingProperties(CBL_Revision* rev, NSDictionary* pro
     AssertEqual(gotRev, rev);
     AssertEqual(gotRev.properties, rev.properties);
     
-    NSArray* revHistory = [db.storage getRevisionHistory: gotRev];
+    NSArray* revHistory = [db getRevisionHistory: gotRev backToRevIDs: nil];
     AssertEq(revHistory.count, history.count);
     for (unsigned i=0; i<history.count; i++) {
         CBL_Revision* hrev = revHistory[i];
@@ -371,8 +410,9 @@ static CBL_Revision* revBySettingProperties(CBL_Revision* rev, NSDictionary* pro
 }
 
 
-static CBLDatabaseChange* announcement(CBL_Revision* rev, CBL_Revision* winner) {
-    return [[CBLDatabaseChange alloc] initWithAddedRevision: rev winningRevision: winner
+static CBLDatabaseChange* announcement(CBLDatabase* db, CBL_Revision* rev, CBL_Revision* winner) {
+    [db getRevisionSequence: rev];
+    return [[CBLDatabaseChange alloc] initWithAddedRevision: rev winningRevisionID: winner.revID
                                                  inConflict: NO source: nil];
 }
 
@@ -395,35 +435,46 @@ static CBLDatabaseChange* announcement(CBL_Revision* rev, CBL_Revision* winner) 
 
     CBL_MutableRevision* rev = [[CBL_MutableRevision alloc] initWithDocID: @"MyDocID" revID: @"4-4444" deleted: NO];
     rev.properties = $dict({@"_id", rev.docID}, {@"_rev", rev.revID}, {@"message", @"hi"});
+    CBL_Revision* revAgain = [rev copy];
     NSArray* history = @[rev.revID, @"3-3333", @"2-2222", @"1-1111"];
     change = nil;
-    CBLStatus status = [db forceInsert: rev revisionHistory: history source: nil];
+    NSError* error;
+    CBLStatus status = [db forceInsert: rev revisionHistory: history source: nil error: &error];
     AssertEq(status, kCBLStatusCreated);
+    AssertNil(error);
     AssertEq(db.documentCount, 1u);
     [self verifyRev: rev history: history existing: 0];
-    AssertEqual(change, announcement(rev, rev));
+    AssertEqual(change, announcement(db, rev, rev));
     Assert(!change.inConflict);
 
+    // No-op forceInsert: of already-existing revision:
+    SequenceNumber lastSeq = db.lastSequenceNumber;
+    status = [db forceInsert: revAgain revisionHistory: history source: nil error: &error];
+    AssertEq(status, kCBLStatusOK);
+    AssertNil(error);
+    AssertEq(db.lastSequenceNumber, lastSeq);
 
     CBL_MutableRevision* conflict = [[CBL_MutableRevision alloc] initWithDocID: @"MyDocID" revID: @"5-5555" deleted: NO];
     conflict.properties = $dict({@"_id", conflict.docID}, {@"_rev", conflict.revID},
                                 {@"message", @"yo"});
     NSArray* conflictHistory = @[conflict.revID, @"4-4545", @"3-3030", @"2-2222", @"1-1111"];
     change = nil;
-    status = [db forceInsert: conflict revisionHistory: conflictHistory source: nil];
+    status = [db forceInsert: conflict revisionHistory: conflictHistory source: nil error: &error];
     AssertEq(status, kCBLStatusCreated);
+    AssertNil(error);
     AssertEq(db.documentCount, 1u);
     [self verifyRev: conflict history: conflictHistory existing: 0];
-    AssertEqual(change, announcement(conflict, conflict));
+    AssertEqual(change, announcement(db, conflict, conflict));
     Assert(change.inConflict);
 
     // Add an unrelated document:
     CBL_MutableRevision* other = [[CBL_MutableRevision alloc] initWithDocID: @"AnotherDocID" revID: @"1-1010" deleted: NO];
     other.properties = $dict({@"language", @"jp"});
     change = nil;
-    status = [db forceInsert: other revisionHistory: @[other.revID] source: nil];
+    status = [db forceInsert: other revisionHistory: @[other.revID] source: nil error: &error];
     AssertEq(status, kCBLStatusCreated);
-    AssertEqual(change, announcement(other, other));
+    AssertNil(error);
+    AssertEqual(change, announcement(db, other, other));
     Assert(!change.inConflict);
 
     // Fetch one of those phantom revisions with no body:
@@ -460,11 +511,12 @@ static CBLDatabaseChange* announcement(CBL_Revision* rev, CBL_Revision* winner) 
     CBL_Revision* del1 = [[CBL_Revision alloc] initWithDocID: conflict.docID revID: nil deleted: YES];
     change = nil;
     del1 = [db putRevision: [del1 mutableCopy] prevRevisionID: conflict.revID
-             allowConflict: NO status: &status];
+             allowConflict: NO status: &status error: &error];
     AssertEq(status, 200);
+    AssertNil(error);
     current = [db getDocumentWithID: rev.docID revisionID: nil];
     AssertEqual(current, rev);
-    AssertEqual(change, announcement(del1, rev));
+    AssertEqual(change, announcement(db, del1, rev));
     
     [self verifyRev: rev history: history existing: 0];
 
@@ -472,13 +524,14 @@ static CBLDatabaseChange* announcement(CBL_Revision* rev, CBL_Revision* winner) 
     CBL_Revision* del2 = [[CBL_Revision alloc] initWithDocID: rev.docID revID: nil deleted: YES];
     change = nil;
     del2 = [db putRevision: [del2 mutableCopy] prevRevisionID: rev.revID
-             allowConflict: NO status: &status];
+             allowConflict: NO status: &status error: &error];
     AssertEq(status, 200);
+    AssertNil(error);
     current = [db getDocumentWithID: rev.docID revisionID: nil];
     AssertEqual(current, nil);
 
     CBL_Revision* maxDel = CBLCompareRevIDs(del1.revID, del2.revID) > 0 ? del1 : nil;
-    AssertEqual(change, announcement(del2, maxDel));
+    AssertEqual(change, announcement(db, del2, maxDel));
     Assert(!change.inConflict);
 
     [[NSNotificationCenter defaultCenter] removeObserver: observer];
@@ -505,23 +558,26 @@ static CBLDatabaseChange* announcement(CBL_Revision* rev, CBL_Revision* winner) 
     rev.properties = $dict({@"_id", rev.docID}, {@"_rev", rev.revID}, {@"message", @"hi"});
     NSArray* history = @[rev.revID];
     change = nil;
-    CBLStatus status = [db forceInsert: rev revisionHistory: history source: nil];
+    NSError* error;
+    CBLStatus status = [db forceInsert: rev revisionHistory: history source: nil error: &error];
     AssertEq(status, 201);
+    AssertNil(error);
     AssertEq(db.documentCount, 1u);
     Assert(!change.inConflict);
     [self verifyRev: rev history: history existing: 0];
-    AssertEqual(change, announcement(rev, rev));
+    AssertEqual(change, announcement(db, rev, rev));
 
     rev = [[CBL_MutableRevision alloc] initWithDocID: @"MyDocID" revID: @"4-4444" deleted: NO];
     rev.properties = $dict({@"_id", rev.docID}, {@"_rev", rev.revID}, {@"message", @"hi"});
     history = @[rev.revID, @"3-3333", @"2-2222", @"1-1111"];
     change = nil;
-    status = [db forceInsert: rev revisionHistory: history source: nil];
+    status = [db forceInsert: rev revisionHistory: history source: nil error: &error];
     AssertEq(status, kCBLStatusCreated);
+    AssertNil(error);
     AssertEq(db.documentCount, 1u);
     Assert(!change.inConflict);
     [self verifyRev: rev history: history existing: 1];
-    AssertEqual(change, announcement(rev, rev));
+    AssertEqual(change, announcement(db, rev, rev));
 
     [[NSNotificationCenter defaultCenter] removeObserver: observer];
 }
@@ -547,441 +603,15 @@ static CBLDatabaseChange* announcement(CBL_Revision* rev, CBL_Revision* winner) 
 
     CBL_Revision* rev2b = [[CBL_Revision alloc] initWithProperties: props];
     CBLStatus status;
+    NSError* error;
     rev2b = [db putRevision: [rev2b mutableCopy]
              prevRevisionID: rev1.revID
               allowConflict: YES
-                     status: &status];
+                     status: &status
+                      error: &error];
     AssertEq(status, kCBLStatusOK);
+    AssertNil(error);
     AssertEqual(rev2b, rev2a);
-}
-
-
-#pragma mark - ATTACHMENTS:
-
-
-static NSDictionary* attachmentsDict(NSData* data, NSString* name, NSString* type, BOOL gzipped) {
-    if (gzipped)
-        data = [NSData gtm_dataByGzippingData: data];
-    NSMutableDictionary* att = $mdict({@"content_type", type}, {@"data", data});
-    if (gzipped)
-        att[@"encoding"] = @"gzip";
-    return $dict({name, att});
-}
-
-static NSDictionary* attachmentsStub(NSString* name) {
-    return @{name: @{@"stub": $true}};
-}
-
-
-- (void) test10_Attachments {
-    RequireTestCase(CRUD);
-    CBL_BlobStore* attachments = db.attachmentStore;
-
-    AssertEq(attachments.count, 0u);
-    AssertEqual(attachments.allKeys, @[]);
-    
-    // Add a revision and an attachment to it:
-    NSData* attach1 = [@"This is the body of attach1" dataUsingEncoding: NSUTF8StringEncoding];
-    NSDictionary* props = @{@"foo": @1,
-                            @"bar": $false,
-                            @"_attachments": attachmentsDict(attach1, @"attach", @"text/plain", NO)};
-    CBL_Revision* rev1;
-    CBLStatus status;
-    rev1 = [db putRevision: [CBL_MutableRevision revisionWithProperties: props]
-            prevRevisionID: nil allowConflict: NO status: &status];
-    AssertEq(status, kCBLStatusCreated);
-
-    CBL_Attachment* att = [db attachmentForRevision: rev1 named: @"attach" status: &status];
-    Assert(att, @"Couldn't get attachment: status %d", status);
-    AssertEqual(att.data, attach1);
-    AssertEqual(att.contentType, @"text/plain");
-    AssertEq(att->encoding, kCBLAttachmentEncodingNone);
-
-    // Check the attachment dict:
-    NSMutableDictionary* itemDict = $mdict({@"content_type", @"text/plain"},
-                                           {@"digest", @"sha1-gOHUOBmIMoDCrMuGyaLWzf1hQTE="},
-                                           {@"length", @(27)},
-                                           {@"stub", $true},
-                                           {@"revpos", @1});
-    NSDictionary* attachmentDict = $dict({@"attach", itemDict});
-    CBL_Revision* gotRev1 = [db getDocumentWithID: rev1.docID revisionID: rev1.revID];
-    AssertEqual(gotRev1[@"_attachments"], attachmentDict);
-    
-    // Check the attachment dict, with attachments included:
-    [itemDict removeObjectForKey: @"stub"];
-    itemDict[@"data"] = [CBLBase64 encode: attach1];
-    gotRev1 = [db getDocumentWithID: rev1.docID revisionID: rev1.revID
-                            options: kCBLIncludeAttachments
-                             status: &status];
-    AssertEqual(gotRev1[@"_attachments"], attachmentDict);
-    
-    // Add a second revision that doesn't update the attachment:
-    props = $dict({@"_id", rev1.docID},
-                  {@"foo", @2},
-                  {@"bazz", $false},
-                  {@"_attachments", attachmentsStub(@"attach")});
-    CBL_Revision* rev2 = [db putRevision: [CBL_MutableRevision revisionWithProperties:props]
-                          prevRevisionID: rev1.revID allowConflict: NO status: &status];
-    AssertEq(status, kCBLStatusCreated);
-
-    // Add a third revision of the same document:
-    NSData* attach2 = [@"<html>And this is attach2</html>" dataUsingEncoding: NSUTF8StringEncoding];
-    props = @{@"_id": rev2.docID,
-              @"foo": @2,
-              @"bazz": $false,
-              @"_attachments": attachmentsDict(attach2, @"attach", @"text/html", NO)};
-    CBL_Revision* rev3 = [db putRevision: [CBL_MutableRevision revisionWithProperties: props]
-                          prevRevisionID: rev2.revID allowConflict: NO status: &status];
-    AssertEq(status, kCBLStatusCreated);
-
-    // Check the 2nd revision's attachment:
-    att = [db attachmentForRevision: rev2 named: @"attach" status: &status];
-    Assert(att, @"Couldn't get attachment: status %d", status);
-    AssertEqual(att.data, attach1);
-    AssertEqual(att.contentType, @"text/plain");
-    AssertEq(att->encoding, kCBLAttachmentEncodingNone);
-    
-    // Check the 3rd revision's attachment:
-    att = [db attachmentForRevision: rev3 named: @"attach" status: &status];
-    Assert(att, @"Couldn't get attachment: status %d", status);
-    AssertEqual(att.data, attach2);
-    AssertEqual(att.contentType, @"text/html");
-    AssertEq(att->encoding, kCBLAttachmentEncodingNone);
-    
-    // Examine the attachment store:
-    AssertEq(attachments.count, 2u);
-    NSSet* expected = [NSSet setWithObjects: [CBL_BlobStore keyDataForBlob: attach1],
-                                             [CBL_BlobStore keyDataForBlob: attach2], nil];
-    AssertEqual([NSSet setWithArray: attachments.allKeys], expected);
-    
-    Assert([db compact: NULL]);  // This clears the body of the first revision
-    AssertEq(attachments.count, 1u);
-    AssertEqual(attachments.allKeys, @[[CBL_BlobStore keyDataForBlob: attach2]]);
-}
-
-
-static CBL_BlobStoreWriter* blobForData(CBLDatabase* db, NSData* data) {
-    CBL_BlobStoreWriter* blob = db.attachmentWriter;
-    [blob appendData: data];
-    [blob finish];
-    return blob;
-}
-
-
-- (CBL_Revision*) putDoc: (NSString*)docID
-          withAttachment: (NSString*) attachmentText
-              compressed: (BOOL)compress
-{
-    NSData* attachmentData = [attachmentText dataUsingEncoding: NSUTF8StringEncoding];
-    NSString* encoding = nil;
-    NSNumber* length = nil;
-    if (compress) {
-        length = @(attachmentData.length);
-        encoding = @"gzip";
-        attachmentData = [NSData gtm_dataByGzippingData: attachmentData];
-    }
-    NSString* base64 = [CBLBase64 encode: attachmentData];
-    NSDictionary* attachmentDict = $dict({@"attach", $dict({@"content_type", @"text/plain"},
-                                                           {@"data", base64},
-                                                           {@"encoding", encoding},
-                                                           {@"length", length}
-                                                           )});
-    NSDictionary* props = $dict({@"_id", docID},
-                                {@"foo", @1},
-                                {@"bar", $false},
-                                {@"_attachments", attachmentDict});
-    CBLStatus status;
-    CBL_Revision* rev = [db putRevision: [CBL_MutableRevision revisionWithProperties: props]
-                         prevRevisionID: nil allowConflict: NO status: &status];
-    AssertEq(status, kCBLStatusCreated);
-    return rev;
-}
-
-
-- (void) test11_PutAttachment {
-    RequireTestCase(CBL_Database_CRUD);
-    // Put a revision that includes an _attachments dict:
-    CBL_Revision* rev1 = [self putDoc: nil withAttachment: @"This is the body of attach1" compressed: NO];
-    AssertEqual(rev1[@"_attachments"], $dict({@"attach", $dict({@"content_type", @"text/plain"},
-                                                                {@"digest", @"sha1-gOHUOBmIMoDCrMuGyaLWzf1hQTE="},
-                                                                {@"length", @(27)},
-                                                                {@"stub", $true},
-                                                                {@"revpos", @1})}));
-
-    // Examine the attachment store:
-    AssertEq(db.attachmentStore.count, 1u);
-    
-    // Get the revision:
-    CBL_Revision* gotRev1 = [db getDocumentWithID: rev1.docID revisionID: rev1.revID];
-    NSDictionary* attachmentDict = gotRev1[@"_attachments"];
-    AssertEqual(attachmentDict, $dict({@"attach", $dict({@"content_type", @"text/plain"},
-                                                         {@"digest", @"sha1-gOHUOBmIMoDCrMuGyaLWzf1hQTE="},
-                                                         {@"length", @(27)},
-                                                         {@"stub", $true},
-                                                         {@"revpos", @1})}));
-    
-    // Update the attachment directly:
-    CBLStatus status;
-    NSData* attachv2 = [@"Replaced body of attach" dataUsingEncoding: NSUTF8StringEncoding];
-    [db updateAttachment: @"attach" body: blobForData(db, attachv2)
-                    type: @"application/foo"
-                encoding: kCBLAttachmentEncodingNone
-                 ofDocID: rev1.docID revID: nil
-                  status: &status];
-    AssertEq(status, kCBLStatusConflict);
-    [db updateAttachment: @"attach" body: blobForData(db, attachv2)
-                    type: @"application/foo"
-                encoding: kCBLAttachmentEncodingNone
-                 ofDocID: rev1.docID revID: @"1-deadbeef"
-                  status: &status];
-    AssertEq(status, kCBLStatusConflict);
-    CBL_Revision* rev2 = [db updateAttachment: @"attach" body: blobForData(db, attachv2)
-                                        type: @"application/foo"
-                                   encoding: kCBLAttachmentEncodingNone
-                                    ofDocID: rev1.docID revID: rev1.revID
-                                     status: &status];
-    AssertEq(status, kCBLStatusCreated);
-    AssertEqual(rev2.docID, rev1.docID);
-    AssertEq(rev2.generation, 2u);
-
-    // Get the updated revision:
-    CBL_Revision* gotRev2 = [db getDocumentWithID: rev2.docID revisionID: rev2.revID];
-    attachmentDict = gotRev2[@"_attachments"];
-    AssertEqual(attachmentDict, $dict({@"attach", $dict({@"content_type", @"application/foo"},
-                                                         {@"digest", @"sha1-mbT3208HI3PZgbG4zYWbDW2HsPk="},
-                                                         {@"length", @(23)},
-                                                         {@"stub", $true},
-                                                         {@"revpos", @2})}));
-
-    CBL_Attachment* gotAttach = [db attachmentForRevision: gotRev2 named: @"attach" status: &status];
-    Assert(gotAttach, @"Couldn't get attachment: status %d", status);
-    AssertEqual(gotAttach.data, attachv2);
-
-    // Delete the attachment:
-    [db updateAttachment: @"nosuchattach" body: nil type: nil
-                encoding: kCBLAttachmentEncodingNone
-                 ofDocID: rev2.docID revID: rev2.revID
-                  status: &status];
-    AssertEq(status, kCBLStatusAttachmentNotFound);
-    [db updateAttachment: @"nosuchattach" body: nil type: nil
-                encoding: kCBLAttachmentEncodingNone
-                 ofDocID: @"nosuchdoc" revID: @"nosuchrev"
-                  status: &status];
-    AssertEq(status, kCBLStatusNotFound);
-    CBL_Revision* rev3 = [db updateAttachment: @"attach" body: nil type: nil
-                                     encoding: kCBLAttachmentEncodingNone
-                                      ofDocID: rev2.docID revID: rev2.revID
-                                       status: &status];
-    AssertEq(status, kCBLStatusOK);
-    AssertEqual(rev3.docID, rev2.docID);
-    AssertEq(rev3.generation, 3u);
-
-    // Get the updated revision:
-    CBL_Revision* gotRev3 = [db getDocumentWithID: rev3.docID revisionID: rev3.revID];
-    AssertNil((gotRev3.properties)[@"_attachments"]);
-}
-
-
-- (void)test11_PutEncodedAttachment {
-    RequireTestCase(CBL_Database_PutAttachment);
-    CBL_Revision* rev1 = [self putDoc: nil withAttachment: @"This is the body of attach1" compressed: YES];
-    AssertEqual(rev1[@"_attachments"], $dict({@"attach", $dict({@"content_type", @"text/plain"},
-                                                                {@"digest", @"sha1-Wk8g89eb0Y+5DtvMKkf+/g90Mhc="},
-                                                                {@"length", @(27)},
-                                                                {@"encoded_length", @(45)},
-                                                                {@"encoding", @"gzip"},
-                                                                {@"stub", $true},
-                                                                {@"revpos", @1})}));
-
-    // Examine the attachment store:
-    AssertEq(db.attachmentStore.count, 1u);
-
-    // Get the revision:
-    CBL_Revision* gotRev1 = [db getDocumentWithID: rev1.docID revisionID: rev1.revID];
-    NSDictionary* attachmentDict = gotRev1[@"_attachments"];
-    AssertEqual(attachmentDict, $dict({@"attach", $dict({@"content_type", @"text/plain"},
-                                                         {@"digest", @"sha1-Wk8g89eb0Y+5DtvMKkf+/g90Mhc="},
-                                                         {@"length", @(27)},
-                                                         {@"encoded_length", @(45)},
-                                                         {@"encoding", @"gzip"},
-                                                         {@"stub", $true},
-                                                         {@"revpos", @1})}));
-}
-
-
-// Test that updating an attachment via a PUT correctly updates its revpos.
-- (void) test12_AttachmentRevPos {
-    RequireTestCase(PutAttachment);
-
-    // Put a revision that includes an _attachments dict:
-    NSData* attach1 = [@"This is the body of attach1" dataUsingEncoding: NSUTF8StringEncoding];
-    NSString* base64 = [CBLBase64 encode: attach1];
-    NSDictionary* attachmentDict = $dict({@"attach", $dict({@"content_type", @"text/plain"},
-                                                           {@"data", base64})});
-    NSDictionary* props = $dict({@"foo", @1},
-                                {@"bar", $false},
-                                {@"_attachments", attachmentDict});
-    CBL_Revision* rev1;
-    CBLStatus status;
-    rev1 = [db putRevision: [CBL_MutableRevision revisionWithProperties: props]
-            prevRevisionID: nil allowConflict: NO status: &status];
-    AssertEq(status, kCBLStatusCreated);
-
-    AssertEqual((rev1[@"_attachments"])[@"attach"][@"revpos"], @1);
-
-    // Update the attachment with another PUT:
-    NSData* attach2 = [@"This WAS the body of attach1" dataUsingEncoding: NSUTF8StringEncoding];
-    base64 = [CBLBase64 encode: attach2];
-    attachmentDict = $dict({@"attach", $dict({@"content_type", @"text/plain"},
-                                             {@"data", base64})});
-    props = $dict({@"_id", rev1.docID},
-                  {@"foo", @2},
-                  {@"bar", $true},
-                  {@"_attachments", attachmentDict});
-    CBL_Revision* rev2;
-    rev2 = [db putRevision: [CBL_MutableRevision revisionWithProperties: props]
-            prevRevisionID: rev1.revID allowConflict: NO status: &status];
-    AssertEq(status, kCBLStatusCreated);
-
-    // The punch line: Did the revpos get incremented to 2?
-    AssertEqual((rev2[@"_attachments"])[@"attach"][@"revpos"], @2);
-    [db _close];
-}
-
-
-- (void) test13_GarbageCollectAttachments {
-    NSMutableArray* revs = $marray();
-    for (int i=0; i<100; i++) {
-        [revs addObject: [self putDoc: $sprintf(@"doc-%d", i)
-                       withAttachment: $sprintf(@"Attachment #%d", i)
-                           compressed: NO]];
-    }
-    for (int i=0; i<40; i++) {
-        CBLStatus status;
-        revs[i] = [db updateAttachment: @"attach" body: nil type: nil
-                              encoding: kCBLAttachmentEncodingNone
-                               ofDocID: [revs[i] docID] revID: [revs[i] revID]
-                                status: &status];
-    }
-
-    NSError* error;
-    Assert([db compact: &error], @"Compact failed: %@", error);
-    AssertEq(db.attachmentStore.count, 60u);
-    [db _close];
-}
-
-
-#if 0
-- (void) test14_EncodedAttachment {
-    RequireTestCase(CBL_Database_CRUD);
-    // Start with a fresh database in /tmp:
-    CBLDatabase* db = createDB();
-
-    // Add a revision and an attachment to it:
-    CBL_Revision* rev1;
-    CBLStatus status;
-    rev1 = [db putRevision: [CBL_Revision revisionWithProperties:$dict({@"foo", @1},
-                                                                     {@"bar", $false})]
-            prevRevisionID: nil allowConflict: NO status: &status];
-    AssertEq(status, kCBLStatusCreated);
-    
-    NSData* attach1 = [@"Encoded! Encoded!Encoded! Encoded! Encoded! Encoded! Encoded! Encoded!"
-                            dataUsingEncoding: NSUTF8StringEncoding];
-    NSData* encoded = [NSData gtm_dataByGzippingData: attach1];
-    insertAttachment(self, encoded,
-                     rev1.sequence,
-                     @"attach", @"text/plain",
-                     kCBLAttachmentEncodingGZIP,
-                     attach1.length,
-                     encoded.length,
-                     rev1.generation);
-    
-    // Read the attachment without decoding it:
-    NSString* type;
-    CBLAttachmentEncoding encoding;
-    AssertEqual([db getAttachmentForSequence: rev1.sequence named: @"attach"
-                                         type: &type encoding: &encoding status: &status], encoded);
-    AssertEq(status, kCBLStatusOK);
-    AssertEqual(type, @"text/plain");
-    AssertEq(encoding, kCBLAttachmentEncodingGZIP);
-    
-    // Read the attachment, decoding it:
-    AssertEqual([db getAttachmentForSequence: rev1.sequence named: @"attach"
-                                         type: &type encoding: NULL status: &status], attach1);
-    AssertEq(status, kCBLStatusOK);
-    AssertEqual(type, @"text/plain");
-    
-    // Check the stub attachment dict:
-    NSMutableDictionary* itemDict = $mdict({@"content_type", @"text/plain"},
-                                           {@"digest", @"sha1-fhfNE/UKv/wgwDNPtNvG5DN/5Bg="},
-                                           {@"length", @(70)},
-                                           {@"encoding", @"gzip"},
-                                           {@"encoded_length", @(37)},
-                                           {@"stub", $true},
-                                           {@"revpos", @1});
-    NSDictionary* attachmentDict = $dict({@"attach", itemDict});
-    AssertEqual([db getAttachmentDictForSequence: rev1.sequence options: 0], attachmentDict);
-    CBL_Revision* gotRev1 = [db getDocumentWithID: rev1.docID revisionID: rev1.revID];
-    AssertEqual(gotRev1[@"_attachments"], attachmentDict);
-
-    // Check the attachment dict with encoded data:
-    itemDict[@"data"] = [CBLBase64 encode: encoded];
-    [itemDict removeObjectForKey: @"stub"];
-    AssertEqual([db getAttachmentDictForSequence: rev1.sequence
-                                          options: kCBLIncludeAttachments | kCBLLeaveAttachmentsEncoded],
-                 attachmentDict);
-    gotRev1 = [db getDocumentWithID: rev1.docID revisionID: rev1.revID
-                            options: kCBLIncludeAttachments | kCBLLeaveAttachmentsEncoded
-                             status: &status];
-    AssertEqual(gotRev1[@"_attachments"], attachmentDict);
-
-    // Check the attachment dict with data:
-    itemDict[@"data"] = [CBLBase64 encode: attach1];
-    [itemDict removeObjectForKey: @"encoding"];
-    [itemDict removeObjectForKey: @"encoded_length"];
-    AssertEqual([db getAttachmentDictForSequence: rev1.sequence options: kCBLIncludeAttachments], attachmentDict);
-    gotRev1 = [db getDocumentWithID: rev1.docID revisionID: rev1.revID
-                            options: kCBLIncludeAttachments
-                             status: &status];
-    AssertEqual(gotRev1[@"_attachments"], attachmentDict);
-}
-#endif
-
-
-- (void) test15_StubOutAttachmentsBeforeRevPos {
-    NSDictionary* hello = $dict({@"revpos", @1}, {@"follows", $true});
-    NSDictionary* goodbye = $dict({@"revpos", @2}, {@"data", @"squeeee"});
-    NSDictionary* attachments = $dict({@"hello", hello}, {@"goodbye", goodbye});
-    
-    CBL_MutableRevision* rev = [CBL_MutableRevision revisionWithProperties: $dict({@"_attachments", attachments})];
-    [CBLDatabase stubOutAttachmentsIn: rev beforeRevPos: 3 attachmentsFollow: NO];
-    AssertEqual(rev.properties, $dict({@"_attachments", $dict({@"hello", $dict({@"revpos", @1}, {@"stub", $true})},
-                                                               {@"goodbye", $dict({@"revpos", @2}, {@"stub", $true})})}));
-    
-    rev = [CBL_MutableRevision revisionWithProperties: $dict({@"_attachments", attachments})];
-    [CBLDatabase stubOutAttachmentsIn: rev beforeRevPos: 2 attachmentsFollow: NO];
-    AssertEqual(rev.properties, $dict({@"_attachments", $dict({@"hello", $dict({@"revpos", @1}, {@"stub", $true})},
-                                                               {@"goodbye", goodbye})}));
-    
-    rev = [CBL_MutableRevision revisionWithProperties: $dict({@"_attachments", attachments})];
-    [CBLDatabase stubOutAttachmentsIn: rev beforeRevPos: 1 attachmentsFollow: NO];
-    AssertEqual(rev.properties, $dict({@"_attachments", attachments}));
-    
-    // Now test the "follows" mode:
-    rev = [CBL_MutableRevision revisionWithProperties: $dict({@"_attachments", attachments})];
-    [CBLDatabase stubOutAttachmentsIn: rev beforeRevPos: 3 attachmentsFollow: YES];
-    AssertEqual(rev.properties, $dict({@"_attachments", $dict({@"hello", $dict({@"revpos", @1}, {@"stub", $true})},
-                                                               {@"goodbye", $dict({@"revpos", @2}, {@"stub", $true})})}));
-
-    rev = [CBL_MutableRevision revisionWithProperties: $dict({@"_attachments", attachments})];
-    [CBLDatabase stubOutAttachmentsIn: rev beforeRevPos: 2 attachmentsFollow: YES];
-    AssertEqual(rev.properties, $dict({@"_attachments", $dict({@"hello", $dict({@"revpos", @1}, {@"stub", $true})},
-                                                               {@"goodbye", $dict({@"revpos", @2}, {@"follows", $true})})}));
-    
-    rev = [CBL_MutableRevision revisionWithProperties: $dict({@"_attachments", attachments})];
-    [CBLDatabase stubOutAttachmentsIn: rev beforeRevPos: 1 attachmentsFollow: YES];
-    AssertEqual(rev.properties, $dict({@"_attachments", $dict({@"hello", $dict({@"revpos", @1}, {@"follows", $true})},
-                                                               {@"goodbye", $dict({@"revpos", @2}, {@"follows", $true})})}));
 }
 
 
@@ -1063,6 +693,10 @@ static CBL_BlobStoreWriter* blobForData(CBLDatabase* db, NSData* data) {
 
 
 - (void) test18_FindMissingRevisions {
+    CBL_RevisionList* revs = [[CBL_RevisionList alloc] initWithArray: @[]];
+    CBLStatus status;
+    Assert([db.storage findMissingRevisions: revs status: &status]);
+
     CBL_Revision* doc1r1 = [self putDoc: $dict({@"_id", @"11111"}, {@"key", @"one"})];
     CBL_Revision* doc2r1 = [self putDoc: $dict({@"_id", @"22222"}, {@"key", @"two"})];
     [self putDoc: $dict({@"_id", @"33333"}, {@"key", @"three"})];
@@ -1078,8 +712,7 @@ static CBL_BlobStoreWriter* blobForData(CBLDatabase* db, NSData* data) {
     CBL_Revision* revToFind1 = [[CBL_Revision alloc] initWithDocID: @"11111" revID: @"3-6060" deleted: NO];
     CBL_Revision* revToFind2 = [[CBL_Revision alloc] initWithDocID: @"22222" revID: doc2r2.revID deleted: NO];
     CBL_Revision* revToFind3 = [[CBL_Revision alloc] initWithDocID: @"99999" revID: @"9-4141" deleted: NO];
-    CBL_RevisionList* revs = [[CBL_RevisionList alloc] initWithArray: @[revToFind1, revToFind2, revToFind3]];
-    CBLStatus status;
+    revs = [[CBL_RevisionList alloc] initWithArray: @[revToFind1, revToFind2, revToFind3]];
     Assert([db.storage findMissingRevisions: revs status: &status]);
     AssertEqual(revs.allRevisions, (@[revToFind1, revToFind3]));
     
@@ -1137,6 +770,7 @@ static CBL_BlobStoreWriter* blobForData(CBLDatabase* db, NSData* data) {
     // Add a revision and an attachment:
     CBL_Revision* rev1;
     CBLStatus status;
+    NSError* error;
     NSData* attach1 = [@"This is the body of attach1" dataUsingEncoding: NSUTF8StringEncoding];
     NSDictionary* props = @{@"foo": @1,
                             @"bar": $false,
@@ -1148,14 +782,14 @@ static CBL_BlobStoreWriter* blobForData(CBLDatabase* db, NSData* data) {
                             }
                            };
     rev1 = [db putRevision: [CBL_MutableRevision revisionWithProperties: props]
-            prevRevisionID: nil allowConflict: NO status: &status];
+            prevRevisionID: nil allowConflict: NO status: &status error: &error];
     AssertEq(status, kCBLStatusCreated);
+    AssertNil(error);
 
     NSFileManager* manager = [NSFileManager defaultManager];
     NSString* attachmentStorePath = db.attachmentStorePath;
     AssertEq([manager fileExistsAtPath: attachmentStorePath], YES);
 
-    NSError* error;
     BOOL result = [db deleteDatabase: &error];
     AssertEq(result, YES);
     AssertNil(error);
@@ -1188,16 +822,16 @@ static CBL_Revision* mkrev(NSString* revID) {
 
 - (void) test23_MakeRevisionHistoryDict {
     NSArray* revs = @[mkrev(@"4-jkl"), mkrev(@"3-ghi"), mkrev(@"2-def")];
-    AssertEqual([CBLForestBridge makeRevisionHistoryDict: revs],
+    AssertEqual([CBLDatabase makeRevisionHistoryDict: revs],
                  $dict({@"ids", @[@"jkl", @"ghi", @"def"]},
                        {@"start", @4}));
 
     revs = @[mkrev(@"4-jkl"), mkrev(@"2-def")];
-    AssertEqual([CBLForestBridge makeRevisionHistoryDict: revs],
+    AssertEqual([CBLDatabase makeRevisionHistoryDict: revs],
                  $dict({@"ids", @[@"4-jkl", @"2-def"]}));
 
     revs = @[mkrev(@"12345"), mkrev(@"6789")];
-    AssertEqual([CBLForestBridge makeRevisionHistoryDict: revs],
+    AssertEqual([CBLDatabase makeRevisionHistoryDict: revs],
                  $dict({@"ids", @[@"12345", @"6789"]}));
 }
 
@@ -1245,8 +879,8 @@ static CBL_Revision* mkrev(NSString* revID) {
     // Get an attachment:
     CBL_Revision* rev = [db getDocumentWithID: @"person-0234B8F3A662F09BDE3DAE8E1A3F65CDB2256983"
                                    revisionID: nil];
-    NSData* att = [db dataForAttachmentDict: rev.properties[@"_attachments"][@"picture"]];
-    AssertEq(att.length, 39730u);
+    CBL_Attachment* att = [db attachmentForRevision: rev named: @"picture" status: &status];
+    AssertEq(att.content.length, 39730u);
 
     // This is the one deleted doc:
     rev = [db getDocumentWithID: @"thumbsup:0234B8F3A662F09BDE3DAE8E1A3F65CDB2256983:7999782A-5064-44F7-94C0-6C7BB255380B"
@@ -1267,10 +901,106 @@ static CBL_Revision* mkrev(NSString* revID) {
         NSString* absPath = [dir stringByAppendingPathComponent: path];
         id prot = [[fmgr attributesOfItemAtPath: absPath error: nil] objectForKey: NSFileProtectionKey];
         Log(@"Protection of %@ --> %@", path, prot);
-        AssertEqual(prot, NSFileProtectionCompleteUnlessOpen);
+        // Not checking -shm file as it will have NSFileProtectionNone by default regardless of its
+        // parent directory projection level. However, the -shm file contains non-sensitive information.
+        if (![path hasSuffix:@"-shm"])
+            AssertEqual(prot, NSFileProtectionCompleteUnlessOpen);
     }
 }
 #endif
 #endif
+
+-(void) test26_ReAddAfterPurge {
+
+    NSString* docId = @"test26-ReAddAfterPurge";
+
+    CBL_MutableRevision* rev = [[CBL_MutableRevision alloc] initWithDocID:docId revID:@"1-1111" deleted: NO];
+    rev.properties = $dict({@"_id", rev.docID}, {@"_rev", rev.revID}, {@"testName", @"test26_ReAddAfterPurge"});
+    NSError* error;
+    CBLStatus status = [db forceInsert: rev revisionHistory: nil source: nil error: &error];
+    AssertEq(status, kCBLStatusCreated);
+
+    CBLDocument* redoc = [db existingDocumentWithID:docId];
+    Assert(redoc);
+
+    Assert([redoc purgeDocument: &error]);
+
+    [self reopenTestDB];
+
+    CBL_MutableRevision* revAfterPurge = [[CBL_MutableRevision alloc] initWithDocID:docId revID:@"1-1111" deleted: NO];
+    revAfterPurge.properties = $dict({@"_id", revAfterPurge.docID}, {@"_rev", revAfterPurge.revID}, {@"testName", @"test26_ReAddAfterPurge"});
+    CBLStatus status2 = [db forceInsert: revAfterPurge revisionHistory: nil source: nil error: &error];
+    AssertEq(status2, kCBLStatusCreated);
+}
+
+
+- (void) test27_ChangesSinceSequence {
+    // Create 10 docs:
+    [self createDocuments: 10];
+
+    // Create a new doc with a conflict:
+    CBL_MutableRevision* rev = [[CBL_MutableRevision alloc] initWithDocID: @"MyDocID" revID: @"1-1111" deleted: NO];
+    rev.properties = $dict({@"_id", rev.docID}, {@"_rev", rev.revID}, {@"message", @"hi"});
+    NSArray* history = @[rev.revID];
+    NSError* error;
+    AssertEq([db forceInsert: rev revisionHistory: history source: nil error: &error], 201);
+    rev = [[CBL_MutableRevision alloc] initWithDocID: @"MyDocID" revID: @"1-ffff" deleted: NO];
+    rev.properties = $dict({@"_id", rev.docID}, {@"_rev", rev.revID}, {@"message", @"bye"});
+    history = @[rev.revID];
+    AssertEq([db forceInsert: rev revisionHistory: history source: nil error: &error], 201);
+
+    // Create another new doc with a merged conflict:
+    rev = [[CBL_MutableRevision alloc] initWithDocID: @"MyDocID2" revID: @"1-1111" deleted: NO];
+    rev.properties = $dict({@"_id", rev.docID}, {@"_rev", rev.revID}, {@"message", @"hi"});
+    history = @[rev.revID];
+    AssertEq([db forceInsert: rev revisionHistory: history source: nil error: &error], 201);
+    rev = [[CBL_MutableRevision alloc] initWithDocID: @"MyDocID2" revID: @"1-ffff" deleted: YES];
+    rev.properties = $dict({@"_id", rev.docID}, {@"_rev", rev.revID});
+    history = @[rev.revID];
+    AssertEq([db forceInsert: rev revisionHistory: history source: nil error: &error], 201);
+
+    // Get changes, testing all combinations of includeConflicts and includeDocs:
+    for (int conflicts=0; conflicts <= 1; conflicts++) {
+        for (int bodies=0; bodies <= 1; bodies++) {
+            CBLChangesOptions options = kDefaultCBLChangesOptions;
+            options.includeConflicts = (BOOL)conflicts;
+            options.includeDocs = (BOOL)bodies;
+            CBLStatus status;
+            CBL_RevisionList* changes = [db changesSinceSequence: 0 options: &options filter: NULL params: nil status: &status];
+            AssertEq(changes.count, 12u + 2*conflicts);
+            for (CBL_Revision* change in changes) {
+                if (bodies)
+                    Assert(change.body != nil);
+                else
+                    AssertNil(change.body);
+            }
+
+            if (!conflicts) {
+                AssertEqual(changes[10].revID, @"1-ffff");
+                AssertEqual(changes[11].revID, @"1-1111"); // Non-deleted rev should be current (#896)
+            }
+        }
+    }
+}
+
+
+// Ensure that a database created without auto-compact (by CBL 1.1, or prior to 10/5/15) can
+// stil be opened, since it has to be switched to auto-compact mode.
+- (void) test28_enableAutoCompact {
+    __block NSError* error;
+    [CBLDatabase setAutoCompact: NO];
+    __block CBLDatabase* manualDB = [dbmgr databaseNamed: @"manualcompact" error: &error];
+    Assert(manualDB);
+    [self createDocumentWithProperties: @{} inDatabase: manualDB];
+    Assert([manualDB close: &error]);
+    manualDB = nil;
+
+    [CBLDatabase setAutoCompact: YES];
+    [self allowWarningsIn:^{
+        manualDB = [dbmgr databaseNamed: @"manualcompact" error: &error];
+    }];
+    Assert(manualDB);
+    [manualDB close: &error];
+}
 
 @end

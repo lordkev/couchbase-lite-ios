@@ -59,7 +59,8 @@
 
 - (void) addInput: (id)input length: (UInt64)length {
     [_inputs addObject: input];
-    _length += length;
+    if (_length >= 0)
+        _length += length;
 }
 
 - (void) addStream: (NSInputStream*)stream length: (UInt64)length {
@@ -175,8 +176,10 @@
         return [NSInputStream inputStreamWithFileAtPath: [input path]];
     else if ([input isKindOfClass: [NSInputStream class]])
         return input;
-    else
+    else {
         Assert(NO, @"Invalid input class %@ for CBLMultiStreamWriter", [input class]);
+        return nil;
+    }
 }
 
 
@@ -278,9 +281,9 @@
             
         case NSStreamEventHasSpaceAvailable:
             if (_input && _input.streamStatus < NSStreamStatusOpen) {
-                // CFNetwork workaround; see https://github.com/couchbaselabs/CouchbaseLite-iOS/issues/99
+                // CFNetwork workaround; see https://github.com/couchbaselabs/TouchDB-iOS/issues/99
                 LogTo(CBLMultiStreamWriter, @"%@:   Input isn't open; waiting...", self);
-                [self performSelector: @selector(retryWrite:) withObject: stream afterDelay: 0.1];
+                [self performSelector: @selector(retryWrite:) withObject: stream afterDelay: 0.001];
             } else if (![self writeToOutput]) {
                 LogTo(CBLMultiStreamWriter, @"%@:   At end -- closing _output!", self);
                 if (_totalBytesWritten != _length && !_error)

@@ -8,12 +8,15 @@
 
 #import "CBLManager.h"
 #import "CBLStatus.h"
-@class CBLDatabase, CBL_Replicator, CBL_Shared;
+@class CBLDatabase, CBL_Shared, CBL_ReplicatorSettings;
+@protocol CBL_Replicator;
 
 
 @interface CBLManager ()
 
-@property (copy, nonatomic) NSString* storageType;      // @"SQLite" (default) or @"ForestDB"
+@property (copy, nonatomic) NSString* replicatorClassName;  // defaults to "CBLRestReplicator"
+@property (readonly) Class replicatorClass;
+
 
 - (NSString*) nameOfDatabaseAtPath: (NSString*)path;
 
@@ -25,6 +28,9 @@
 
 - (void) _forgetDatabase: (CBLDatabase*)db;
 
+- (BOOL) _closeDatabaseNamed: (NSString*)name
+                       error: (NSError**)outError;
+
 @property (readonly) NSArray* allOpenDatabases;
 
 @property (readonly) CBL_Shared* shared;
@@ -32,7 +38,12 @@
 - (CBLStatus) validateReplicatorProperties: (NSDictionary*)properties;
 
 /** Creates a new CBL_Replicator, or returns an existing active one if it has the same properties. */
-- (CBL_Replicator*) replicatorWithProperties: (NSDictionary*)body
+- (id<CBL_Replicator>) replicatorWithProperties: (NSDictionary*)body
                                     status: (CBLStatus*)outStatus;
+
+/** Get a replicator settings from a given property. */
+- (CBL_ReplicatorSettings*) replicatorSettingsWithProperties: (NSDictionary*)body
+                                                  toDatabase: (CBLDatabase**)outDatabase // may be NULL
+                                                      status: (CBLStatus*)outStatus;
 
 @end

@@ -6,16 +6,10 @@
 //  Copyright (c) 2013 Couchbase, Inc. All rights reserved.
 //
 
-#import <Foundation/Foundation.h>
+#import "CBLBase.h"
 @class CBLModel;
 
-#if __has_feature(nullability) // Xcode 6.3+
-#pragma clang assume_nonnull begin
-#else
-#define nullable
-#define __nullable
-#endif
-
+NS_ASSUME_NONNULL_BEGIN
 
 /** An array of CBLModel objects, that's actually backed by document IDs.
     It looks up the model dynamically as each item is accessed.
@@ -26,21 +20,19 @@
 /** Initializes a model array from an array of document ID strings.
     Returns nil if docIDs contains items that are non-strings, or invalid document IDs. */
 - (instancetype) initWithOwner: (CBLModel*)owner
-                      property: (NSString*)property
-                     itemClass: (Class)itemClass
-                        docIDs: (NSArray*)docIDs;
+                      property: (nullable NSString*)property
+                     itemClass: (nullable Class)itemClass
+                        docIDs: (CBLArrayOf(NSString*)*)docIDs;
 
 /** Initializes a model array from an array of CBLModels. */
 - (instancetype) initWithOwner: (CBLModel*)owner
-                      property: (NSString*)property
-                     itemClass: (Class)itemClass
-                        models: (NSArray*)models;
+                      property: (nullable NSString*)property
+                     itemClass: (nullable Class)itemClass
+                        models: (CBLArrayOf(CBLModel*)*)models;
 
-@property (readonly) NSArray* docIDs;
+@property (readonly) CBLArrayOf(NSString*)* docIDs;
 
 @end
 
 
-#if __has_feature(nullability)
-#pragma clang assume_nonnull end
-#endif
+NS_ASSUME_NONNULL_END

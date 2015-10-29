@@ -192,11 +192,7 @@ static void CheckCacheable(Router_Tests* self, NSString* path) {
     Log(@"PUT returned %@", result);
     revID = result[@"rev"];
     Assert([revID hasPrefix: @"2-"]);
-    
-    Send(self, @"GET", @"/db/doc1", kCBLStatusOK,
-         $dict({@"_id", @"doc1"}, {@"_rev", revID}, {@"message", @"goodbye"}));
-    CheckCacheable(self, @"/db/doc1");
-    
+
     // Add more docs:
     result = SendBody(self, @"PUT", @"/db/doc3", $dict({@"message", @"hello"}), 
                                     kCBLStatusCreated, nil);
@@ -231,7 +227,28 @@ static void CheckCacheable(Router_Tests* self, NSString* path) {
 
 - (void) test_Docs {
     RequireTestCase(Databases);
-    [self populateDocs];
+    NSArray* revIDs = [self populateDocs];
+
+    Send(self, @"GET", @"/db/doc2", kCBLStatusOK,
+         $dict({@"_id", @"doc2"}, {@"_rev", revIDs[1]}, {@"message", @"hello"}));
+    CheckCacheable(self, @"/db/doc2");
+
+    Send(self, @"GET", @"/db/doc2?revs=true", kCBLStatusOK,
+         @{@"_id": @"doc2",
+           @"_rev": revIDs[1],
+           @"_revisions": @{@"ids": @[[revIDs[1] substringFromIndex: 2]], @"start": @1},
+           @"message": @"hello"});
+
+    Send(self, @"GET", @"/db/doc2?revs_info=true", kCBLStatusOK,
+         @{@"_id": @"doc2",
+           @"_rev": revIDs[1],
+           @"_revs_info": @[@{@"rev": revIDs[1], @"status": @"available"}],
+           @"message": @"hello"});
+
+    Send(self, @"GET", @"/db/doc2?conflicts=true", kCBLStatusOK,
+         @{@"_id": @"doc2",
+           @"_rev": revIDs[1],
+           @"message": @"hello"});
 }
 
 
@@ -299,6 +316,20 @@ static void CheckCacheable(Router_Tests* self, NSString* path) {
                                     {@"doc", $dict({@"message", @"bonjour"},
                                                    {@"_id", @"doc3"}, {@"_rev", revID3} )})
                               ));
+
+    // keys:
+    result = SendBody(self, @"POST", @"/db/_all_docs",
+                      $dict({@"keys", $array(@"doc1", @"doc2", @"doc3", @"doc4")}),
+                      kCBLStatusOK, nil);
+    rows = result[@"rows"];
+    AssertEqual(rows, $array($dict({@"id",  @"doc1"}, {@"key", @"doc1"},
+                                   {@"value", $dict({@"rev", revID})}),
+                             $dict({@"id",  @"doc2"}, {@"key", @"doc2"},
+                                   {@"value", $dict({@"rev", revID2})}),
+                             $dict({@"id",  @"doc3"}, {@"key", @"doc3"},
+                                   {@"value", $dict({@"rev", revID3})}),
+                             $dict({@"error",  @"not_found"}, {@"key", @"doc4"})
+                             ));
 }
 
 
@@ -467,6 +498,34 @@ static void CheckCacheable(Router_Tests* self, NSString* path) {
     Assert(![db viewNamed: @"design/view"].stale);
     Assert(![db viewNamed: @"design/view2"].stale);
 
+    // Try include_docs
+    Send(self, @"GET", @"/db/_design/design/_view/view2?include_docs=true&limit=1", kCBLStatusOK,
+         $dict({@"offset", @0},
+               {@"rows", $array($dict({@"id", @"doc4"},
+                                      {@"key", @2},
+                                      {@"value", @"hi"},
+                                      {@"doc", @{@"_id": @"doc4",
+                                                 @"_rev": @"1-cfdd78e822bbcbc25c91e9deb9537c4b",
+                                                 @"message": @"hi"}}
+                                      ))},
+               {@"total_rows", @4}));
+
+    // Try include_docs with revs=true
+    Send(self, @"GET", @"/db/_design/design/_view/view2?include_docs=true&revs=true&limit=1", kCBLStatusOK,
+         $dict({@"offset", @0},
+               {@"rows", $array($dict({@"id", @"doc4"},
+                                      {@"key", @2},
+                                      {@"value", @"hi"},
+                                      {@"doc", @{@"_id": @"doc4",
+                                                 @"_rev": @"1-cfdd78e822bbcbc25c91e9deb9537c4b",
+                                                 @"_revisions": @{
+                                                         @"start": @1,
+                                                         @"ids": @[@"cfdd78e822bbcbc25c91e9deb9537c4b"]
+                                                         },
+                                                 @"message": @"hi"}}
+                                      ))},
+               {@"total_rows", @4}));
+
     [CBLView setCompiler: nil];
     [CBLDatabase setFilterCompiler: nil];
 }
@@ -527,6 +586,35 @@ static void CheckCacheable(Router_Tests* self, NSString* path) {
     Send(self, @"GET", @"/db/_changes?since=5", kCBLStatusOK,
          $dict({@"last_seq", @5},
                {@"results", @[]}));
+
+    // _changes with include_docs:
+    Send(self, @"GET", @"/db/_changes?since=4&include_docs=true", kCBLStatusOK,
+         $dict({@"last_seq", @5},
+               {@"results", $array($dict({@"id", @"doc1"},
+                                         {@"changes", $array($dict({@"rev", revIDs[0]}))},
+                                         {@"seq", @5},
+                                         {@"deleted", $true},
+                                         {@"doc", @{@"_id": @"doc1",
+                                                    @"_rev": revIDs[0],
+                                                    @"_deleted": @YES}}))}));
+    
+
+    // _changes with include_docs and revs=true:
+    Send(self, @"GET", @"/db/_changes?since=4&include_docs=true&revs=true", kCBLStatusOK,
+         $dict({@"last_seq", @5},
+               {@"results", $array($dict({@"id", @"doc1"},
+                                         {@"changes", $array($dict({@"rev", revIDs[0]}))},
+                                         {@"seq", @5},
+                                         {@"deleted", $true},
+                                         {@"doc", @{@"_id": @"doc1",
+                                                    @"_rev": revIDs[0],
+                                                    @"_revisions": @{
+                                                            @"ids": @[@"69e1c04b38d144220169834e4a1d6b65",
+                                                                      @"641a9554032af9bcb2351b2780161a4d",
+                                                                      @"9c7ff8308d0c89a7f1fe0f4b683655c2"],
+                                                            @"start": @3},
+                                                    @"_deleted": @YES}}))}));
+    
 }
 
 
@@ -726,7 +814,86 @@ static void CheckCacheable(Router_Tests* self, NSString* path) {
 }
 
 
+- (void) test_ChangesDescending {
+    RequireTestCase(Changes);
+    NSArray* revIDs = [self populateDocs];
+
+    // _changes with descending = false
+    Send(self, @"GET", @"/db/_changes?descending=false", kCBLStatusOK,
+         $dict({@"last_seq", @5},
+               {@"results", $array($dict({@"id", @"doc3"},
+                                         {@"changes", $array($dict({@"rev", revIDs[2]}))},
+                                         {@"seq", @3}),
+                                   $dict({@"id", @"doc2"},
+                                         {@"changes", $array($dict({@"rev", revIDs[1]}))},
+                                         {@"seq", @4}),
+                                   $dict({@"id", @"doc1"},
+                                         {@"changes", $array($dict({@"rev", revIDs[0]}))},
+                                         {@"seq", @5},
+                                         {@"deleted", $true}))}));
+    if (self.isSQLiteDB ) {
+        // _changes with descending = true
+        Send(self, @"GET", @"/db/_changes?descending=true", kCBLStatusOK,
+             $dict({@"last_seq", @3},
+                   {@"results", $array($dict({@"id", @"doc1"},
+                                             {@"changes", $array($dict({@"rev", revIDs[0]}))},
+                                             {@"seq", @5},
+                                             {@"deleted", $true}),
+                                       $dict({@"id", @"doc2"},
+                                             {@"changes", $array($dict({@"rev", revIDs[1]}))},
+                                             {@"seq", @4}),
+                                       $dict({@"id", @"doc3"},
+                                             {@"changes", $array($dict({@"rev", revIDs[2]}))},
+                                             {@"seq", @3}))}));
+
+
+        // _changes with descending = true and limit = 2
+        Send(self, @"GET", @"/db/_changes?descending=true&limit=2", kCBLStatusOK,
+             $dict({@"last_seq", @4},
+                   {@"results", $array($dict({@"id", @"doc1"},
+                                             {@"changes", $array($dict({@"rev", revIDs[0]}))},
+                                             {@"seq", @5},
+                                             {@"deleted", $true}),
+                                       $dict({@"id", @"doc2"},
+                                             {@"changes", $array($dict({@"rev", revIDs[1]}))},
+                                             {@"seq", @4}))}));
+
+        Send(self, @"GET", @"/db/_changes?descending=true&feed=continuous", kCBLStatusBadParam, nil);
+        Send(self, @"GET", @"/db/_changes?descending=true&feed=longpoll", kCBLStatusBadParam, nil);
+    } else {
+        // https://github.com/couchbase/couchbase-lite-ios/issues/641
+        Send(self, @"GET", @"/db/_changes?descending=true", kCBLStatusNotImplemented, nil);
+        Send(self, @"GET", @"/db/_changes?descending=true&limit=2", kCBLStatusNotImplemented, nil);
+        Send(self, @"GET", @"/db/_changes?descending=true&feed=continuous", kCBLStatusBadParam, nil);
+        Send(self, @"GET", @"/db/_changes?descending=true&feed=longpoll", kCBLStatusBadParam, nil);
+    }
+}
+
+
 #pragma mark - ATTACHMENTS:
+
+
+- (void) test_PutAttachmentToNewDoc {
+    CBLResponse* response = SendRequest(self, @"PUT", @"/db/doc1/attach.txt",
+                                        @{@"Content-Type": @"text/plain"},
+                                        [@"Hello there" dataUsingEncoding: NSUTF8StringEncoding]);
+    AssertEq(response.status, 201);
+}
+
+
+- (void) test_PutAttachmentToExistingDoc {
+    NSDictionary* props = $dict({@"message", @"hello"});
+    NSDictionary* result = SendBody(self, @"PUT", @"/db/doc1", props, kCBLStatusCreated, nil);
+    NSString* rev = result[@"rev"];
+    Assert(rev);
+
+    CBLResponse* response;
+    response = SendRequest(self, @"PUT",
+                           $sprintf(@"/db/doc1/attach.txt?rev=%@", rev),
+                           @{@"Content-Type": @"text/plain"},
+                           [@"Hello there" dataUsingEncoding: NSUTF8StringEncoding]);
+    AssertEq(response.status, 201);
+}
 
 
 - (NSDictionary*) createDocWithAttachment: (NSData*)attach1 and: (NSData*) attach2 {
@@ -781,16 +948,17 @@ static void CheckCacheable(Router_Tests* self, NSString* path) {
                            @{@"Accept": @"application/json"}, nil);
     AssertEq(response.status, kCBLStatusOK);
     AssertEqual((response.body)[@"_attachments"],
-                 $dict({@"attach", $dict({@"data", [CBLBase64 encode: attach1]}, 
+                $dict({@"attach", $dict({@"data", [CBLBase64 encode: attach1]},
                                         {@"content_type", @"text/plain"},
                                         {@"length", @(attach1.length)},
                                         {@"digest", @"sha1-gOHUOBmIMoDCrMuGyaLWzf1hQTE="},
-                                         {@"revpos", @1})},
-                       {@"path/to/attachment", $dict({@"data", [CBLBase64 encode: attach2]}, 
-                                         {@"content_type", @"text/plain"},
-                                         {@"length", @(attach2.length)},
-                                         {@"digest", @"sha1-IrXQo0jpePvuKPv5nswnenqsIMc="},
-                                         {@"revpos", @1})}));
+                                        {@"revpos", @1})},
+                       {@"path/to/attachment",
+                                  $dict({@"data", [CBLBase64 encode: attach2]},
+                                        {@"content_type", @"text/plain"},
+                                        {@"length", @(attach2.length)},
+                                        {@"digest", @"sha1-IrXQo0jpePvuKPv5nswnenqsIMc="},
+                                        {@"revpos", @1})}));
 
     // Update the document but not the attachments:
     NSDictionary *attachmentDict, *props;
@@ -810,19 +978,13 @@ static void CheckCacheable(Router_Tests* self, NSString* path) {
     Send(self, @"GET", path, kCBLStatusOK, 
          $dict({@"_id", @"doc1"}, {@"_rev", revID}, {@"message", @"aloha"},
                {@"_attachments", $dict({@"attach", $dict({@"stub", $true}, 
-                                                         {@"content_type", @"text/plain"},
-                                                         {@"length", @(attach1.length)},
-                                                         {@"digest", @"sha1-gOHUOBmIMoDCrMuGyaLWzf1hQTE="},
                                                          {@"revpos", @1})},
                                        {@"path/to/attachment", $dict({@"stub", $true}, 
-                                                                     {@"content_type", @"text/plain"},
-                                                                     {@"length", @(attach2.length)},
-                                                                     {@"digest", @"sha1-IrXQo0jpePvuKPv5nswnenqsIMc="},
                                                                      {@"revpos", @1})})}));
 }
 
 - (void) test_GetJSONAttachment {
-    // Create a document with two json-like attachements. One with be put as 'text/plain' and
+    // Create a document with two json-like attachments. One with be put as 'text/plain' and
     // the other one will be put as 'application/json'.
     NSData* attach1 = [@"{\"name\": \"foo\"}" dataUsingEncoding: NSUTF8StringEncoding];
     NSData* attach2 = [@"{\"name\": \"bar\"}" dataUsingEncoding: NSUTF8StringEncoding];
@@ -860,6 +1022,7 @@ static void CheckCacheable(Router_Tests* self, NSString* path) {
     NSData* attach2 = [@"This is the body of path/to/attachment" dataUsingEncoding: NSUTF8StringEncoding];
     [self createDocWithAttachment: attach1 and: attach2];
 
+    // 5-15:
     CBLResponse* response = SendRequest(self, @"GET", @"/db/doc1/attach",
                                        $dict({@"Range", @"bytes=5-15"}),
                                        nil);
@@ -867,6 +1030,7 @@ static void CheckCacheable(Router_Tests* self, NSString* path) {
     AssertEqual((response.headers)[@"Content-Range"], @"bytes 5-15/27");
     AssertEqual(response.body.asJSON, [@"is the body" dataUsingEncoding: NSUTF8StringEncoding]);
 
+    // 12-:
     response = SendRequest(self, @"GET", @"/db/doc1/attach",
                                        $dict({@"Range", @"bytes=12-"}),
                                        nil);
@@ -874,6 +1038,15 @@ static void CheckCacheable(Router_Tests* self, NSString* path) {
     AssertEqual((response.headers)[@"Content-Range"], @"bytes 12-26/27");
     AssertEqual(response.body.asJSON, [@"body of attach1" dataUsingEncoding: NSUTF8StringEncoding]);
 
+    // 12-100:
+    response = SendRequest(self, @"GET", @"/db/doc1/attach",
+                           $dict({@"Range", @"bytes=12-100"}),
+                           nil);
+    AssertEq(response.status, 206);
+    AssertEqual((response.headers)[@"Content-Range"], @"bytes 12-26/27");
+    AssertEqual(response.body.asJSON, [@"body of attach1" dataUsingEncoding: NSUTF8StringEncoding]);
+
+    // -7:
     response = SendRequest(self, @"GET", @"/db/doc1/attach",
                                        $dict({@"Range", @"bytes=-7"}),
                                        nil);
@@ -888,6 +1061,54 @@ static void CheckCacheable(Router_Tests* self, NSString* path) {
                                  {@"If-None-Match", eTag}),
                            nil);
     AssertEq(response.status, 304);
+
+    // 5-3:
+    response = SendRequest(self, @"GET", @"/db/doc1/attach",
+                           $dict({@"Range", @"bytes=5-3"}),
+                           nil);
+    AssertEq(response.status, 200); // full range
+    AssertNil((response.headers)[@"Content-Range"]);
+    AssertEqual(response.body.asJSON, [@"This is the body of attach1" dataUsingEncoding: NSUTF8StringEncoding]);
+
+    // -100:
+    response = SendRequest(self, @"GET", @"/db/doc1/attach",
+                           $dict({@"Range", @"bytes=-100"}),
+                           nil);
+    AssertEq(response.status, 200); // full range
+    AssertNil((response.headers)[@"Content-Range"]);
+    AssertEqual(response.body.asJSON, [@"This is the body of attach1" dataUsingEncoding: NSUTF8StringEncoding]);
+
+    // 100-:
+    response = SendRequest(self, @"GET", @"/db/doc1/attach",
+                           $dict({@"Range", @"bytes=100-"}),
+                           nil);
+    AssertEq(response.status, 416);
+    AssertEqual((response.headers)[@"Content-Range"], @"bytes */27");
+    AssertNil(response.body);
+
+    // 500-100:
+    response = SendRequest(self, @"GET", @"/db/doc1/attach",
+                           $dict({@"Range", @"bytes=500-100"}),
+                           nil);
+    AssertEq(response.status, 200); // full range
+    AssertNil((response.headers)[@"Content-Range"]);
+    AssertEqual(response.body.asJSON, [@"This is the body of attach1" dataUsingEncoding: NSUTF8StringEncoding]);
+    
+    // 0-27:
+    response = SendRequest(self, @"GET", @"/db/doc1/attach",
+                           $dict({@"Range", @"bytes=500-100"}),
+                           nil);
+    AssertEq(response.status, 200); // full range
+    AssertNil((response.headers)[@"Content-Range"]);
+    AssertEqual(response.body.asJSON, [@"This is the body of attach1" dataUsingEncoding: NSUTF8StringEncoding]);
+    
+    // 27-28:
+    response = SendRequest(self, @"GET", @"/db/doc1/attach",
+                           $dict({@"Range", @"bytes=27-28"}),
+                           nil);
+    AssertEq(response.status, 416);
+    AssertEqual((response.headers)[@"Content-Range"], @"bytes */27");
+    AssertNil(response.body);
 }
 
 
@@ -1073,7 +1294,7 @@ static void CheckCacheable(Router_Tests* self, NSString* path) {
     AssertEqual(error.domain, NSURLErrorDomain);
     AssertEq(error.code, NSURLErrorCannotFindHost);
     
-    CBL_Server* server = [CBL_Server createEmptyAtTemporaryPath: @"CBL_URLProtocolTest"];
+    CBL_Server* server = [CBL_RunLoopServer createEmptyAtTemporaryPath: @"CBL_URLProtocolTest"];
     NSURL* root = [CBL_URLProtocol registerServer: server forHostname: @"some.hostname"];
     AssertEqual(root, url);
     AssertEq([CBL_URLProtocol serverForHostname: @"some.hostname"], server);
@@ -1099,7 +1320,7 @@ static void CheckCacheable(Router_Tests* self, NSString* path) {
 - (void) test_URLProtocol {
     RequireTestCase(CBL_Router);
     [CBL_URLProtocol forgetServers];
-    CBL_Server* server = [CBL_Server createEmptyAtTemporaryPath: @"CBL_URLProtocolTest"];
+    CBL_Server* server = [CBL_RunLoopServer createEmptyAtTemporaryPath: @"CBL_URLProtocolTest"];
     [CBL_URLProtocol setServer: server];
     
     NSURL* url = [NSURL URLWithString: @"cbl:///"];
@@ -1123,5 +1344,153 @@ static void CheckCacheable(Router_Tests* self, NSString* path) {
     [CBL_URLProtocol setServer: nil];
 }
 
+#pragma mark - Validation:
+
+- (void) test_ValidationMessage {
+    [db setValidationNamed: @"onlyMyDocs"
+                   asBlock: ^(CBLRevision *rev, id<CBLValidationContext> context) {
+                       if (!rev.isDeletion) {
+                           if (![rev.properties[@"type"] isEqualToString:@"doc"])
+                               [context reject];
+                           else if (![rev.properties[@"from"] isEqualToString:@"me"])
+                               [context rejectWithMessage: @"This is not a user doc."];
+                       } else {
+                           BOOL allowed = [rev.parentRevision.properties[@"allow_delete"] boolValue];
+                           if (!allowed)
+                               [context rejectWithMessage: @"This document cannot be deleted."];
+                       }
+    }];
+
+    NSDictionary* result;
+
+    // do_POST OK:
+    result = SendBody(self, @"POST", @"/db",
+             $dict({@"type", @"doc"},
+                   {@"from", @"me"},
+                   {@"title", @"doc1"}), kCBLStatusCreated, nil);
+    Assert(result[@"ok"] != nil);
+    Assert(result[@"id"] != nil);
+    Assert(result[@"rev"] != nil);
+
+    // do_POST forbidden, default message:
+    result = SendBody(self, @"POST", @"/db",
+                      $dict({@"type", @"nondoc"},
+                            {@"from", @"me"},
+                            {@"title", @"nondoc1"}), kCBLStatusForbidden, nil);
+    AssertNil(result[@"rev"]);
+    AssertEqual(result[@"status"], @(403));
+    AssertEqual(result[@"error"], @"forbidden");
+    AssertEqual(result[@"reason"], @"invalid document");
+
+    // do_POST forbidden, custom message:
+    result = SendBody(self, @"POST", @"/db",
+                      $dict({@"type", @"doc"},
+                            {@"from", @"you"},
+                            {@"title", @"doc2"}), kCBLStatusForbidden, nil);
+    AssertEqual(result[@"status"], @(403));
+    AssertEqual(result[@"error"], @"forbidden");
+    AssertEqual(result[@"reason"], @"This is not a user doc.");
+
+    // do_PUT OK:
+    result = SendBody(self, @"PUT", @"/db/doc3",
+                      $dict({@"type", @"doc"},
+                            {@"from", @"me"},
+                            {@"title", @"doc3"}), kCBLStatusCreated, nil);
+    Assert(result[@"ok"] != nil);
+    Assert(result[@"id"] != nil);
+    Assert(result[@"rev"] != nil);
+
+    // do_PUT forbidden, default message:
+    result = SendBody(self, @"PUT", @"/db/doc4",
+                      $dict({@"type", @"nondoc"},
+                            {@"from", @"me"},
+                            {@"title", @"doc4"}), kCBLStatusForbidden, nil);
+    AssertNil(result[@"rev"]);
+    AssertEqual(result[@"status"], @(403));
+    AssertEqual(result[@"error"], @"forbidden");
+    AssertEqual(result[@"reason"], @"invalid document");
+
+    // do_PUT forbidden, custom message:
+    result = SendBody(self, @"PUT", @"/db/doc5",
+                      $dict({@"type", @"doc"},
+                            {@"from", @"you"},
+                            {@"title", @"doc5"}), kCBLStatusForbidden, nil);
+    AssertNil(result[@"rev"]);
+    AssertEqual(result[@"status"], @(403));
+    AssertEqual(result[@"error"], @"forbidden");
+    AssertEqual(result[@"reason"], @"This is not a user doc.");
+
+    // do_POST_bulk_docs, OK:
+    NSArray* bulkResult;
+    bulkResult = SendBody(self, @"POST", @"/db/_bulk_docs",
+                          $dict({@"docs", $array($dict({@"type", @"doc"},
+                                                       {@"from", @"me"},
+                                                       {@"title", @"doc6"}),
+                                                 $dict({@"type", @"doc"},
+                                                       {@"from", @"me"},
+                                                       {@"title", @"doc7"})
+                                                 )}), kCBLStatusCreated, nil);
+    AssertEq((int)bulkResult.count, 2);
+    for (NSDictionary *r in bulkResult) {
+        Assert(r[@"ok"] != nil);
+        Assert(r[@"id"] != nil);
+        Assert(r[@"rev"] != nil);
+    }
+
+    // do_POST_bulk_docs, mixed result:
+    bulkResult = SendBody(self, @"POST", @"/db/_bulk_docs",
+                          $dict({@"docs", $array($dict({@"type", @"doc"},
+                                                       {@"from", @"me"},
+                                                       {@"title", @"doc8"}),
+                                                 $dict({@"type", @"nondoc"},
+                                                       {@"from", @"me"},
+                                                       {@"title", @"doc9"}),
+                                                 $dict({@"type", @"doc"},
+                                                       {@"from", @"you"},
+                                                       {@"title", @"doc10"})
+                                                 )}), kCBLStatusCreated, nil);
+    AssertEq((int)bulkResult.count, 3);
+    Assert(bulkResult[0][@"ok"] != nil);
+    Assert(bulkResult[0][@"id"] != nil);
+    Assert(bulkResult[0][@"rev"] != nil);
+    AssertEqual(bulkResult[1][@"status"], @(403));
+    AssertEqual(bulkResult[1][@"error"], @"forbidden");
+    AssertEqual(bulkResult[1][@"reason"], @"invalid document");
+    AssertEqual(bulkResult[2][@"status"], @(403));
+    AssertEqual(bulkResult[2][@"error"], @"forbidden");
+    AssertEqual(bulkResult[2][@"reason"], @"This is not a user doc.");
+
+    // do_POST_bulk_docs, all_or_nothing=true
+    result = SendBody(self, @"POST", @"/db/_bulk_docs",
+                      $dict({@"all_or_nothing", @"true"},
+                            {@"docs", $array($dict({@"type", @"doc"},
+                                                   {@"from", @"me"},
+                                                   {@"title", @"doc11"}),
+                                             $dict({@"type", @"nondoc"},
+                                                   {@"from", @"me"},
+                                                   {@"title", @"doc12"}),
+                                             $dict({@"type", @"doc"},
+                                                   {@"from", @"you"},
+                                                   {@"title", @"doc13"})
+                                             )}), kCBLStatusForbidden, nil);
+    AssertNil(result[@"rev"]);
+    AssertEqual(result[@"status"], @(403));
+    AssertEqual(result[@"error"], @"forbidden");
+    AssertEqual(result[@"reason"], @"invalid document");
+
+    // do_DELETE
+    result = SendBody(self, @"PUT", @"/db/doc14",
+                      $dict({@"type", @"doc"},
+                            {@"from", @"me"},
+                            {@"title", @"doc14"},
+                            {@"allow_delete", $false}), kCBLStatusCreated, nil);
+    NSString* doc14RevID = result[@"rev"];
+    Assert(doc14RevID != nil);
+    result = Send(self, @"DELETE", $sprintf(@"/db/doc14?rev=%@", doc14RevID),
+                  kCBLStatusForbidden, nil);
+    AssertEqual(result[@"status"], @(403));
+    AssertEqual(result[@"error"], @"forbidden");
+    AssertEqual(result[@"reason"], @"This document cannot be deleted.");
+}
 
 @end

@@ -22,15 +22,20 @@
 #import "Logging.h"
 
 
-@interface CBLHTTPResponse ()
-- (void) onResponseReady: (CBLResponse*)response;
-- (void) onDataAvailable: (NSData*)data finished: (BOOL)finished;
-- (void) onFinished;
-@end
-
-
-
 @implementation CBLHTTPResponse
+{
+    CBL_Router* _router;
+    CBLHTTPConnection* _connection;
+    CBLResponse* _response;
+    BOOL _finished;
+    BOOL _askedIfChunked;
+    BOOL _chunked;
+    BOOL _delayedHeaders;
+    NSData* _data;              // Data received, waiting to be read by the connection
+    BOOL _dataMutable;          // Is _data an NSMutableData?
+    UInt64 _dataOffset;         // Offset in response of 1st byte of _data
+    UInt64 _offset;             // Offset in response for next readData
+}
 
 
 - (instancetype) initWithRouter: (CBL_Router*)router forConnection:(CBLHTTPConnection*)connection {
@@ -55,7 +60,9 @@
             router.onAccessCheck = ^CBLStatus(CBLDatabase* db, NSString* docID, SEL action) {
                 if ([method isEqualToString: @"GET"] || [method isEqualToString: @"HEAD"])
                     return kCBLStatusOK;
-                if ([method isEqualToString: @"POST"]) {
+                else if ([method isEqualToString: @"PUT"] && [docID hasPrefix: @"_local/"])
+                    return kCBLStatusOK;
+                else if ([method isEqualToString: @"POST"]) {
                     NSString* actionStr = NSStringFromSelector(action);
                     if ([actionStr isEqualToString: @"do_POST_all_docs:"]
                             || [actionStr isEqualToString: @"do_POST_revs_diff:"])

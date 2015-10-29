@@ -14,7 +14,7 @@
 //  and limitations under the License.
 
 #import "CBLQuery+Geo.h"
-#import "CouchbaseLitePrivate.h"
+#import "CBLInternal.h"
 
 
 @implementation CBLQuery (Geo)
@@ -46,14 +46,14 @@
                    boundingBox: (CBLGeoRect)bbox
                    geoJSONData: (NSData*)geoJSONData
                          value: (NSData*)valueData
-                 docProperties: (NSDictionary*)docProperties
+                   docRevision: (CBL_Revision*)docRevision
                        storage: (id<CBL_QueryRowStorage>)storage
 {
     self = [super initWithDocID: docID
                        sequence: sequence
                             key: nil
                           value: valueData
-                  docProperties: docProperties
+                    docRevision: docRevision
                         storage: storage];
     if (self) {
         _boundingBox = bbox;

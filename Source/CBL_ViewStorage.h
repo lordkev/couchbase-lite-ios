@@ -3,12 +3,12 @@
 //  CouchbaseLite
 //
 //  Created by Jens Alfke on 1/13/15.
-//
+//  Copyright (c) 2015 Couchbase, Inc. All rights reserved.
 //
 
 #import "CBL_StorageTypes.h"
 #import "CBL_Revision.h"    // defines SequenceNumber
-@protocol CBL_ViewStorageDelegate;
+@protocol CBL_ViewStorageDelegate, CBL_QueryRowStorage;
 
 
 /** Storage for a view. Instances are created by CBL_Storage implementations, and are owned by
@@ -60,6 +60,8 @@
 - (CBLQueryIteratorBlock) fullTextQueryWithOptions: (CBLQueryOptions*)options
                                             status: (CBLStatus*)outStatus;
 
+- (id<CBL_QueryRowStorage>) storageForQueryRow: (CBLQueryRow*)row;
+
 #if DEBUG
 /** Just for unit tests and debugging. Returns every row in the index in order, as an NSDictionary
     with keys @"key", @"value" and @"seq". */
@@ -73,14 +75,6 @@
 
 /** Storage for a CBLQueryRow. Instantiated by a CBL_ViewStorage when it creates a CBLQueryRow. */
 @protocol CBL_QueryRowStorage <NSObject>
-
-/** Given the raw data of a row's value, returns YES if this is a non-JSON placeholder representing
-    the entire document. If so, the CBLQueryRow will not parse this data but will instead fetch the
-    document's body from the database and use that as its value. */
-- (BOOL) rowValueIsEntireDoc: (NSData*)valueData;
-
-/** Parses a "normal" (not entire-doc) row value into a JSON-compatible object. */
-- (id) parseRowValue: (NSData*)valueData;
 
 /** Fetches a document's body; called when the row value represents the entire document.
     @param docID  The document ID
@@ -117,5 +111,8 @@
 /** The current map version string. If this changes, the storage's -setVersion: method will be
     called to notify it, so it can invalidate the index. */
 @property (readonly) NSString* mapVersion;
+
+/** The document "type" property values this view is filtered to (nil if none.) */
+@property (readonly) NSString* documentType;
 
 @end

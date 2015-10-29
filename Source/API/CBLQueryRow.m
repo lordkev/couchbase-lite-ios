@@ -3,11 +3,19 @@
 //  CouchbaseLite
 //
 //  Created by Jens Alfke on 2/11/15.
+//  Copyright (c) 2012-2015 Couchbase, Inc. All rights reserved.
 //
-//
+//  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file
+//  except in compliance with the License. You may obtain a copy of the License at
+//    http://www.apache.org/licenses/LICENSE-2.0
+//  Unless required by applicable law or agreed to in writing, software distributed under the
+//  License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+//  either express or implied. See the License for the specific language governing permissions
+//  and limitations under the License.
 
 #import "CBLQuery.h"
 #import "CouchbaseLitePrivate.h"
+#import "CBLInternal.h"
 #import "CBLView+Internal.h"
 
 
@@ -20,19 +28,29 @@ static id fromJSON( NSData* json ) {
 }
 
 
+BOOL CBLQueryRowValueIsEntireDoc(id value) {
+    static NSData* kEntireDocPlaceholder;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        kEntireDocPlaceholder = [NSData dataWithBytes: "*" length: 1];
+    });
+    return [value isEqual: kEntireDocPlaceholder];
+}
+
+
 @implementation CBLQueryRow
 {
     id _key, _value;            // Usually starts as JSON NSData; parsed on demand
     __weak id _parsedKey, _parsedValue;
     UInt64 _sequence;
     NSString* _sourceDocID;
-    NSDictionary* _documentProperties;
+    CBL_Revision* _documentRevision;
     CBLDatabase* _database;
     __weak id<CBL_QueryRowStorage> _storage;
 }
 
 
-@synthesize documentProperties=_documentProperties, sourceDocumentID=_sourceDocID,
+@synthesize sourceDocumentID=_sourceDocID, documentRevision=_documentRevision,
             database=_database, storage=_storage, sequenceNumber=_sequence;
 
 
@@ -40,7 +58,7 @@ static id fromJSON( NSData* json ) {
                       sequence: (SequenceNumber)sequence
                            key: (id)key
                          value: (id)value
-                 docProperties: (NSDictionary*)docProperties
+                   docRevision: (CBL_Revision*)docRevision
                        storage: (id<CBL_QueryRowStorage>)storage
 {
     self = [super init];
@@ -52,7 +70,7 @@ static id fromJSON( NSData* json ) {
         _sequence = sequence;
         _key = [key copy];
         _value = [value copy];
-        _documentProperties = [docProperties copy];
+        _documentRevision = docRevision;
         _storage = storage;
     }
     return self;
@@ -64,9 +82,15 @@ static id fromJSON( NSData* json ) {
 }
 
 
+- (void) moveToDatabase: (CBLDatabase*)database view: (CBLView*)view {
+    Assert(database != nil);
+    _database = database;
+    _storage = [view.storage storageForQueryRow: self];
+}
+
+
 - (BOOL) isNonMagicValue {
-    return _value && !( [_value isKindOfClass: [NSData class]]
-                        && [_storage rowValueIsEntireDoc: _value] );
+    return _value && !CBLQueryRowValueIsEntireDoc(_value);
 }
 
 
@@ -82,7 +106,7 @@ static id fromJSON( NSData* json ) {
     if (_database == other->_database
             && $equal(_key, other->_key)
             && $equal(_sourceDocID, other->_sourceDocID)
-            && $equal(_documentProperties, other->_documentProperties)) {
+            && $equal(_documentRevision, other->_documentRevision)) {
         // If values were emitted, compare them. Otherwise we have nothing to go on so check
         // if _anything_ about the doc has changed (i.e. the sequences are different.)
         if ([self isNonMagicValue] || [other isNonMagicValue])
@@ -99,7 +123,7 @@ static id fromJSON( NSData* json ) {
     if (!key) {
         key = _key;
         if ([key isKindOfClass: [NSData class]]) {  // _key may start out as unparsed JSON data
-            key = fromJSON(_key);
+            key = fromJSON(key);
             _parsedKey = key;
         }
     }
@@ -113,19 +137,28 @@ static id fromJSON( NSData* json ) {
         if ([value isKindOfClass: [NSData class]]) {
             // _value may start out as unparsed Collatable data
             id<CBL_QueryRowStorage> storage = _storage;
-            Assert(storage);
-            if ([storage rowValueIsEntireDoc: _value]) {
+            if (!storage) {
+                Warn(@"CBLQueryRow.value: cannot get the value, the database is gone");
+                return nil;
+            }
+            if (CBLQueryRowValueIsEntireDoc(value)) {
                 // Value is a placeholder ("*") denoting that the map function emitted "doc" as
                 // the value. So load the body of the revision now:
-                Assert(_sequence);
-                CBLStatus status;
-                value = [storage documentPropertiesWithID: _sourceDocID
-                                                 sequence: _sequence
-                                                   status: &status];
-                if (!value)
-                    Warn(@"%@: Couldn't load doc for row value: status %d", self, status);
+                if (_documentRevision) {
+                    value = _documentRevision.properties;
+                } else {
+                    Assert(_sequence);
+                    CBLStatus status;
+                    value = [storage documentPropertiesWithID: _sourceDocID
+                                                     sequence: _sequence
+                                                       status: &status];
+                    if (!value)
+                        Warn(@"%@: Couldn't load doc for row value: status %d", self, status);
+                }
             } else {
-                value = [storage parseRowValue: _value];
+                value = [CBLJSON JSONObjectWithData: _value
+                                            options: CBLJSONReadingAllowFragments
+                                              error: NULL];
             }
             _parsedValue = value;
         }
@@ -134,23 +167,33 @@ static id fromJSON( NSData* json ) {
 }
 
 
+- (NSDictionary*) documentProperties {
+    return _documentRevision.properties;
+}
+
+
 - (NSString*) documentID {
-    // _documentProperties may have been 'redirected' from a different document
-    return _documentProperties.cbl_id ?: _sourceDocID;
+    // Get the doc id from either the embedded document contents, or the '_id' value key.
+    // Failing that, there's no document linking, so use the regular old _sourceDocID
+    if (_documentRevision)
+        return _documentRevision.docID;
+    id docID = $castIf(NSDictionary, self.value).cbl_id;
+    if (![docID isKindOfClass: [NSString class]])
+        docID = _sourceDocID;
+    return docID;
 }
 
 
 - (NSString*) documentRevisionID {
     // Get the revision id from either the embedded document contents,
     // or the '_rev' or 'rev' value key:
-    NSString* rev = _documentProperties.cbl_rev;
-    if (!rev) {
-        NSDictionary* value = $castIf(NSDictionary, self.value);
-        rev = value.cbl_rev;
-        if (value && !rev)
-            rev = value[@"rev"];
-    }
-    return $castIf(NSString, rev);
+    if (_documentRevision)
+        return _documentRevision.revID;
+    NSDictionary* value = $castIf(NSDictionary, self.value);
+    NSString* rev = value.cbl_rev;
+    if (value && !rev)
+        rev = $castIf(NSString, value[@"rev"]);
+    return rev;
 }
 
 
@@ -189,6 +232,7 @@ static id fromJSON( NSData* json ) {
     NSString* docID = self.documentID;
     if (!docID)
         return nil;
+    Assert(_database != nil);
     CBLDocument* doc = [_database documentWithID: docID];
     [doc loadCurrentRevisionFrom: self];
     return doc;
@@ -198,6 +242,7 @@ static id fromJSON( NSData* json ) {
 - (NSArray*) conflictingRevisions {
     // The "_conflicts" value property is added when the query's allDocsMode==kCBLShowConflicts;
     // see -[CBLDatabase getAllDocs:] in CBLDatabase+Internal.m.
+    Assert(_database != nil);
     CBLDocument* doc = [_database documentWithID: self.sourceDocumentID];
     NSDictionary* value = $castIf(NSDictionary, self.value);
     NSArray* conflicts = $castIf(NSArray, value[@"_conflicts"]);
@@ -214,7 +259,7 @@ static id fromJSON( NSData* json ) {
         return $dict({@"key", self.key},
                      {@"value", self.value},
                      {@"id", _sourceDocID},
-                     {@"doc", _documentProperties});
+                     {@"doc", self.documentProperties});
     } else {
         return $dict({@"key", self.key}, {@"error", @"not_found"});
     }
@@ -222,16 +267,28 @@ static id fromJSON( NSData* json ) {
 }
 
 
+static NSString* jsonStr(id o) {
+    if (!o)
+        return nil;
+    return [CBLJSON stringWithJSONObject: o options: CBLJSONWritingAllowFragments error: nil];
+}
+
+
 - (NSString*) description {
-    NSString* valueStr = @"nil";
-    if (self.value)
-        valueStr = [CBLJSON stringWithJSONObject: self.value
-                                         options: CBLJSONWritingAllowFragments error: nil];
     return [NSString stringWithFormat: @"%@[key=%@; value=%@; id=%@]",
-            [self class],
-            [CBLJSON stringWithJSONObject: self.key options: CBLJSONWritingAllowFragments error: nil],
-            valueStr,
-            self.documentID];
+            [self class], jsonStr(self.key), jsonStr(self.value), self.documentID];
+}
+
+
+- (id) debugQuickLookObject {
+    NSMutableString* result = [NSMutableString stringWithFormat: @"Key:   %@\nValue: %@",
+                               jsonStr(self.key), jsonStr(self.value)];
+    if (self.documentID) {
+        [result appendFormat: @"\nDocID: %@", self.documentID];
+        if (_documentRevision)
+            [result appendFormat: @" (rev %@)", _documentRevision];
+    }
+    return result;
 }
 
 

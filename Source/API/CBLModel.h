@@ -9,13 +9,7 @@
 #import "MYDynamicObject.h"
 #import "CBLDocument.h"
 
-#if __has_feature(nullability) // Xcode 6.3+
-#pragma clang assume_nonnull begin
-#else
-#define nullable
-#define __nullable
-#endif
-
+NS_ASSUME_NONNULL_BEGIN
 @class CBLAttachment, CBLDatabase;
 
 
@@ -39,6 +33,9 @@ NS_REQUIRES_PROPERTY_DEFINITIONS  // Don't let compiler auto-synthesize properti
  The document won't be written to the database until -save is called. */
 + (instancetype) modelForNewDocumentInDatabase: (CBLDatabase*)database;
 
+// You cannot create CBLModel instances with -init. Use the factory class methods instead.
+- (instancetype) init NS_UNAVAILABLE;
+
 /** The document this item is associated with. Will be nil if it's new and unsaved. */
 @property (readonly, strong, nullable) CBLDocument* document;
 
@@ -54,7 +51,7 @@ NS_REQUIRES_PROPERTY_DEFINITIONS  // Don't let compiler auto-synthesize properti
 
 /** Writes any changes to a new revision of the document.
     Returns YES without doing anything, if no changes have been made. */
-- (BOOL) save: (__nullable NSError**)outError;
+- (BOOL) save: (NSError**)outError;
 
 /** Should changes be saved back to the database automatically?
     Defaults to NO, requiring you to call -save manually. */
@@ -76,7 +73,7 @@ NS_REQUIRES_PROPERTY_DEFINITIONS  // Don't let compiler auto-synthesize properti
 
 /** Deletes the document from the database. 
     You can still use the model object afterwards, but it will refer to the deleted revision. */
-- (BOOL) deleteDocument: (__nullable NSError**)outError;
+- (BOOL) deleteDocument: (NSError**)outError;
 
 /** The time interval since the document was last changed externally (e.g. by a "pull" replication.
     This value can be used to highlight recently-changed objects in the UI. */
@@ -89,8 +86,8 @@ NS_REQUIRES_PROPERTY_DEFINITIONS  // Don't let compiler auto-synthesize properti
     @param models  An array of CBLModel objects, which must all be in the same database.
     @param outError  On return, the error (if the call failed.)
     @return  A RESTOperation that saves all changes, or nil if none of the models need saving. */
-+ (BOOL) saveModels: (NSArray*)models
-              error: (__nullable NSError**)outError;
++ (BOOL) saveModels: (CBLArrayOf(CBLModel*)*)models
+              error: (NSError**)outError;
 
 /** Resets the timeSinceExternallyChanged property to zero. */
 - (void) markExternallyChanged;
@@ -107,9 +104,25 @@ NS_REQUIRES_PROPERTY_DEFINITIONS  // Don't let compiler auto-synthesize properti
        ofProperty: (NSString*)property;
 
 
+/** Follows an _inverse_ relationship: returns the other models in the database that have a
+    property named `inverseProperty` that points to this object. For example, if model class
+    ListItem has a property 'list' that's a relation to a List model, then calling this method
+    on a List instance, with relation 'list', will return all the ListItems that refer to this List.
+
+    Specifically, what this does is run a CBLQuery that finds documents whose `relation`
+    property value is equal to the document ID of the receiver. (And if `fromClass` is given,
+    it's restricted to documents whose `type` property is one of the ones mapped to `fromClass`
+    in the CBLModelFactory.)
+    @param relation  The property name to look at
+    @param fromClass  (Optional) The CBLModel subclass to restrict the search to.
+    @return  An array of model objects found, or nil on error. */
+- (CBLArrayOf(CBLModel*)*) findInverseOfRelation: (NSString*)relation
+                                       fromClass: (nullable Class)fromClass;
+
+
 /** The names of all attachments (array of strings).
     This reflects unsaved changes made by creating or deleting attachments. */
-@property (readonly, nullable) NSArray* attachmentNames;
+@property (readonly, nullable) CBLArrayOf(NSString*)* attachmentNames;
 
 /** Looks up the attachment with the given name (without fetching its contents). */
 - (nullable CBLAttachment*) attachmentNamed: (NSString*)name;
@@ -188,6 +201,21 @@ NS_REQUIRES_PROPERTY_DEFINITIONS  // Don't let compiler auto-synthesize properti
     than overriding this one. */
 + (nullable Class) itemClassForArrayProperty: (NSString*)property;
 
+/** General method for declaring the that an array-of-models-valued property is a computed inverse
+    of a relation from another class.
+    Given the property name, the override should return the name of the relation property in the
+    item class (the one returned by +itemClassForArrayProperty:). If it returns nil, then this
+    property will be interpreted as an explicit JSON property whose value is an array of strings
+    corresponding to the other models.
+ 
+    The default implementation of this method checks for the existence of a class method with
+    selector of the form +propertyInverseRelation where 'property' is replaced by the actual
+    property name. If such a method exists it is called, and must return a string.
+ 
+    In general you'll find it easier to implement the '+propertyInverseRelation' method(s) rather
+    than overriding this one. */
++ (nullable NSString*) inverseRelationForArrayProperty: (NSString*)property;
+
 /** The type of document. This is optional, but is commonly used in document databases 
     to distinguish different types of documents. CBLModelFactory can use this property to 
     determine what CBLModel subclass to instantiate for a document. */
@@ -201,19 +229,17 @@ NS_REQUIRES_PROPERTY_DEFINITIONS  // Don't let compiler auto-synthesize properti
 @interface CBLDatabase (CBLModel)
 
 /** All CBLModels associated with this database whose needsSave is true. */
-@property (readonly) NSArray* unsavedModels;
+@property (readonly) CBLArrayOf(CBLModel*)* unsavedModels;
 
 /** Saves changes to all CBLModels associated with this database whose needsSave is true. */
-- (BOOL) saveAllModels: (__nullable NSError**)outError;
+- (BOOL) saveAllModels: (NSError**)outError;
 
 /** Immediately runs any pending autosaves for all CBLModels associated with this database.
     (On iOS, this will automatically be called when the application is about to quit or go into the
     background. On Mac OS it is NOT called automatically.) */
-- (BOOL) autosaveAllModels: (__nullable NSError**)outError;
+- (BOOL) autosaveAllModels: (NSError**)outError;
 
 @end
 
 
-#if __has_feature(nullability)
-#pragma clang assume_nonnull end
-#endif
+NS_ASSUME_NONNULL_END

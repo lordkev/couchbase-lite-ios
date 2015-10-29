@@ -1,5 +1,7 @@
 # Couchbase Lite 
 
+[![Join the chat at https://gitter.im/couchbase/couchbase-lite-ios](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/couchbase/mobile?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
+
 **Couchbase Lite** is an embedded lightweight, document-oriented (NoSQL), syncable database engine. 
 
 Get more info and downloads of Couchbase Lite (for iOS and Android) via [the Couchbase mobile portal](http://mobile.couchbase.com)
@@ -107,4 +109,3 @@ If you want the very latest and greatest (and possibly buggy) version, you'll ne
 [22]: https://github.com/couchbase/couchbase-lite-ios/wiki/Why-Couchbase-Lite%3F#history
 [23]: https://github.com/couchbase/couchbase-lite-ios/wiki/Replication-Algorithm
 
-[![githalytics.com alpha](https://cruel-carlota.pagodabox.com/dd0341b0dc5dcfad9f86b4ef5b44a65f "githalytics.com")](http://githalytics.com/couchbase/couchbase-lite-ios)

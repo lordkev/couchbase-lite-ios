@@ -3,12 +3,12 @@
 //  CouchbaseLite
 //
 //  Created by Jens Alfke on 1/13/15.
-//
+//  Copyright (c) 2015 Couchbase, Inc. All rights reserved.
 //
 
 #import "CBL_Revision.h"
 #import "CBL_StorageTypes.h"
-@class CBLDatabaseChange, CBLManager;
+@class CBLDatabaseChange, CBLManager, CBLSymmetricKey, MYAction;
 @protocol CBL_ViewStorage;
 @protocol CBL_StorageDelegate;
 
@@ -85,19 +85,18 @@
 /** Retrieves a document revision by ID.
     @param docID  The document ID
     @param revID  The revision ID; may be nil, meaning "the current revision".
-    @param options  Specifies which data to include in the JSON.
+    @param withBody  If NO, revision's body won't be loaded
     @param outStatus  If returning nil, store a CBLStatus error value here.
     @return  The revision, or nil if not found. */
 - (CBL_MutableRevision*) getDocumentWithID: (NSString*)docID
                                 revisionID: (NSString*)revID
-                                   options: (CBLContentOptions)options
+                                  withBody: (BOOL)withBody
                                     status: (CBLStatus*)outStatus;
 
 /** Loads the body of a revision.
     On entry, rev.docID and rev.revID will be valid.
-    On success, rev.body will be valid. */
-- (CBLStatus) loadRevisionBody: (CBL_MutableRevision*)rev
-                       options: (CBLContentOptions)options;
+    On success, rev.body and rev.sequence will be valid. */
+- (CBLStatus) loadRevisionBody: (CBL_MutableRevision*)rev;
 
 /** Looks up the sequence number of a revision.
     Will only be called on revisions whose .sequence property is not already set.
@@ -107,13 +106,11 @@
 /** Retrieves the parent revision of a revision, or returns nil if there is no parent. */
 - (CBL_Revision*) getParentRevision: (CBL_Revision*)rev;
 
-/** Returns the given revision's list of direct ancestors (as CBL_Revision objects) in _reverse_
-    chronological order, starting with the revision itself. */
-- (NSArray*) getRevisionHistory: (CBL_Revision*)rev;
-
-/** Returns the revision history as a _revisions dictionary, as returned by the REST API's ?revs=true option. If 'ancestorRevIDs' is present, the revision history will only go back as far as any of the revision ID strings in that array. */
-- (NSDictionary*) getRevisionHistoryDict: (CBL_Revision*)rev
-                       startingFromAnyOf: (NSArray*)ancestorRevIDs;
+/** Returns an array of CBL_Revisions giving the revision history in reverse order, starting from
+    `rev` and going back to any of the revision IDs in `ancestorRevIDs` (or all the way back if
+    that array is empty or nil.) */
+- (NSArray*) getRevisionHistory: (CBL_Revision*)rev
+                   backToRevIDs: (NSSet*)ancestorRevIDs;
 
 /** Returns all the known revisions (or all current/conflicting revisions) of a document.
     @param docID  The document ID
@@ -177,6 +174,7 @@
                 the operation by returning an error status.
     @param status  On return a status will be stored here. Note that on success, the
                 status should be 201 for a created revision but 200 for a deletion.
+    @param outError  On return, an error indicating a reason of the failure
     @return  The new revision, with its revID and sequence filled in, or nil on error. */
 - (CBL_Revision*) addDocID: (NSString*)docID
                  prevRevID: (NSString*)prevRevID
@@ -184,7 +182,8 @@
                   deleting: (BOOL)deleting
              allowConflict: (BOOL)allowConflict
            validationBlock: (CBL_StorageValidationBlock)validationBlock
-                    status: (CBLStatus*)status;
+                    status: (CBLStatus*)status
+                     error: (NSError**)outError;
 
 /** Inserts an already-existing revision (with its revID), plus its ancestry, into a document.
     This is called by the pull replicator to add the revisions received from the server.
@@ -198,11 +197,13 @@
                 the operation by returning an error status.
     @param source  The URL of the remote database this was pulled from, or nil if it's local.
                 (This will be used to create the CBLDatabaseChange object sent to the delegate.)
+    @param outError  On return, an error indicating a reason of the failure.
     @return  Status code; 200 on success, otherwise an error. */
 - (CBLStatus) forceInsert: (CBL_Revision*)inRev
           revisionHistory: (NSArray*)history
           validationBlock: (CBL_StorageValidationBlock)validationBlock
-                   source: (NSURL*)source;
+                   source: (NSURL*)source
+                    error: (NSError**)outError;
 
 /** Purges specific revisions, which deletes them completely from the local database _without_ adding a "tombstone" revision. It's as though they were never there.
     @param docsToRevs  A dictionary mapping document IDs to arrays of revision IDs.
@@ -250,6 +251,15 @@
                     prevRevisionID: (NSString*)prevRevID
                           obeyMVCC: (BOOL)obeyMVCC
                             status: (CBLStatus*)outStatus;
+
+@optional
+
+/** Registers the encryption key of the database file. Must be called before opening the db. */
+- (void) setEncryptionKey: (CBLSymmetricKey*)key;
+
+/** Called when the delegate changes its encryptionKey property. The storage should rewrite its
+    files using the new key (which may be nil, meaning no encryption.) */
+- (MYAction*) actionToChangeEncryptionKey: (CBLSymmetricKey*)newKey;
 
 @end
 

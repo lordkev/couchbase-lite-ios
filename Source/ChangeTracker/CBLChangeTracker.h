@@ -14,7 +14,7 @@
 //  and limitations under the License.
 
 #import <Foundation/Foundation.h>
-@class CBLChangeTracker;
+@class CBLChangeTracker, CBLCookieStorage, BLIPHTTPLogic;
 @protocol CBLAuthorizer;
 
 
@@ -22,6 +22,7 @@
 - (BOOL) changeTrackerApproveSSLTrust: (SecTrustRef)serverTrust
                               forHost: (NSString*)host
                                  port: (UInt16)port;
+- (void) changeTrackerReceivedHTTPHeaders: (NSDictionary*)headers;
 - (void) changeTrackerReceivedSequence: (id)sequence
                                  docID: (NSString*)docID
                                 revIDs: (NSArray*)revIDs
@@ -59,8 +60,10 @@ typedef enum CBLChangeTrackerMode {
     NSTimeInterval _heartbeat;
     NSDictionary* _requestHeaders;
     id<CBLAuthorizer> _authorizer;
+    CBLCookieStorage* _cookieStorage;
     unsigned _retryCount;
     BOOL _caughtUp;
+    BLIPHTTPLogic* _http;
 }
 
 - (instancetype) initWithDatabaseURL: (NSURL*)databaseURL
@@ -79,6 +82,8 @@ typedef enum CBLChangeTrackerMode {
 @property (weak, nonatomic) id<CBLChangeTrackerClient> client;
 @property (strong, nonatomic) NSDictionary *requestHeaders;
 @property (strong, nonatomic) id<CBLAuthorizer> authorizer;
+@property (strong, nonatomic) CBLCookieStorage* cookieStorage;
+
 @property (nonatomic) BOOL usePOST;
 
 @property (nonatomic) CBLChangeTrackerMode mode;

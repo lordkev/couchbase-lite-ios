@@ -17,7 +17,7 @@
 #import "CBLBase64.h"
 #import "CBLDatabase+Internal.h"
 #import "CBL_BlobStore.h"
-#import "GTMNSData+zlib.h"
+#import "CBLGZip.h"
 
 
 static NSString* blobKeyToDigest(CBLBlobKey key) {
@@ -97,8 +97,8 @@ static NSString* blobKeyToDigest(CBLBlobKey key) {
                 return nil;
             }
             self.possiblyEncodedLength = _data.length;
-        } else if ([attachInfo[@"stub"] isEqual: $true]) {
-            // This item is just a stub; validate and skip it
+        } else {
+            // Get the revpos:
             id revPosObj = attachInfo[@"revpos"];
             if (revPosObj) {
                 int revPos = [$castIf(NSNumber, revPosObj) intValue];
@@ -108,16 +108,19 @@ static NSString* blobKeyToDigest(CBLBlobKey key) {
                 }
                 self->revpos = (unsigned)revPos;
             }
-            return self; // skip
-        } else if ([attachInfo[@"follows"] isEqual: $true]) {
-            // I can't handle this myself; my caller will look it up from the digest
-            if (!_digest) {
+            if ([attachInfo[@"stub"] isEqual: $true]) {
+                // Stub with nothing else
+                return self;
+            } else if ([attachInfo[@"follows"] isEqual: $true]) {
+                // Attachment with _follows must have a digest to match with the MIME body
+                if (!_digest) {
+                    *outStatus = kCBLStatusBadAttachment;
+                    return nil;
+                }
+            } else {
                 *outStatus = kCBLStatusBadAttachment;
                 return nil;
             }
-        } else {
-            *outStatus = kCBLStatusBadAttachment;
-            return nil;
         }
     }
     return self;
@@ -196,7 +199,12 @@ static NSString* blobKeyToDigest(CBLBlobKey key) {
 }
 
 
-- (NSData*) data {
+- (BOOL) hasContent {
+    return [_database.attachmentStore hasBlobForKey: _blobKey];
+}
+
+
+- (NSData*) encodedContent {
     if (_data)
         return _data;
     else
@@ -204,23 +212,37 @@ static NSString* blobKeyToDigest(CBLBlobKey key) {
 }
 
 
-- (NSData*) decodedData {
-    NSData* data = self.data;
-    switch (encoding) {
-        case kCBLAttachmentEncodingNone:
-            break;
-        case kCBLAttachmentEncodingGZIP:
-            data = [NSData gtm_dataByInflatingData: data];
+- (NSData*) content {
+    NSData* data = self.encodedContent;
+    if (data) {
+        switch (encoding) {
+            case kCBLAttachmentEncodingNone:
+                break;
+            case kCBLAttachmentEncodingGZIP:
+                data = [CBLGZip dataByDecompressingData: data];
+                if (!data)
+                    Warn(@"Unable to decode attachment!");
+        }
     }
-    if (!data)
-        Warn(@"Unable to decode attachment!");
     return data;
 }
 
 
-- (NSURL*) dataURL {
-    NSString* path = [_database.attachmentStore pathForKey: _blobKey];
-    return path ? [NSURL fileURLWithPath: path] : nil;
+- (NSInputStream*) contentStream {
+    if (encoding == kCBLAttachmentEncodingNone)
+        return [_database.attachmentStore blobInputStreamForKey: _blobKey length: NULL];
+    else {
+        NSData* content = self.content;
+        return content ? [NSInputStream inputStreamWithData: content] : nil;
+    }
+}
+
+
+- (NSURL*) contentURL {
+    NSString* path = [_database.attachmentStore blobPathForKey: _blobKey];
+    if (!path || ![[NSFileManager defaultManager] fileExistsAtPath: path isDirectory: NULL])
+        return nil;
+    return [NSURL fileURLWithPath: path];
 }
 
 

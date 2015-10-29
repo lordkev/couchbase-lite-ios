@@ -6,24 +6,19 @@
 //  Copyright (c) 2012-2013 Couchbase, Inc. All rights reserved.
 //
 
-#import <Foundation/Foundation.h>
+#import "CBLBase.h"
 
 @class CBLDatabase, CBLDocument;
-@class CBLLiveQuery, CBLQueryEnumerator, CBLQueryRow;
+@class CBLLiveQuery, CBLQueryEnumerator, CBLQueryRow, CBLRevision;
 
-#if __has_feature(nullability) // Xcode 6.3+
-#pragma clang assume_nonnull begin
-#else
-#define nullable
-#define __nullable
-#endif
-
+NS_ASSUME_NONNULL_BEGIN
 
 typedef NS_ENUM(unsigned, CBLAllDocsMode) {
     kCBLAllDocs,            /**< Normal behavior for all-docs query */
     kCBLIncludeDeleted,     /**< Will include rows for deleted documents */
     kCBLShowConflicts,      /**< Rows will indicate conflicting revisions */
-    kCBLOnlyConflicts       /**< Will _only_ return rows for docs in conflict */
+    kCBLOnlyConflicts,      /**< Will _only_ return rows for docs in conflict */
+    kCBLBySequence          /**< Order by sequence number (i.e. chronologically) */
 };
 
 
@@ -90,7 +85,7 @@ typedef NS_ENUM(unsigned, CBLIndexUpdateMode) {
     "value" to refer to the value, or "key" to refer to the key.
     A limited form of array indexing is supported, so you can refer to "key[1]" or "value[0]" if
     the key or value are arrays. This only works with indexes from 0 to 3. */
-@property (copy, nullable) NSArray* sortDescriptors;
+@property (copy, nullable) CBLArrayOf(NSSortDescriptor*)* sortDescriptors;
 
 /** An optional predicate that filters the resulting query rows.
     If present, it's called on every row returned from the query, and if it returns NO
@@ -122,7 +117,7 @@ typedef NS_ENUM(unsigned, CBLIndexUpdateMode) {
     contents of each document. */
 @property BOOL prefetch;
 
-/** Changes the behavior of a query created by -queryAllDocuments.
+/** Changes the behavior of a query created by -createAllDocumentsQuery.
     * In mode kCBLAllDocs (the default), the query simply returns all non-deleted documents.
     * In mode kCBLIncludeDeleted, it also returns deleted documents.
     * In mode kCBLShowConflicts, the .conflictingRevisions property of each row will return the
@@ -134,7 +129,7 @@ typedef NS_ENUM(unsigned, CBLIndexUpdateMode) {
 
 /** Sends the query to the server and returns an enumerator over the result rows (Synchronous).
     Note: In a CBLLiveQuery you should access the .rows property instead. */
-- (nullable CBLQueryEnumerator*) run: (__nullable NSError**)outError;
+- (nullable CBLQueryEnumerator*) run: (NSError**)outError;
 
 /** Starts an asynchronous query. Returns immediately, then calls the onComplete block when the
     query completes, passing it the row enumerator (or an error). */
@@ -142,6 +137,8 @@ typedef NS_ENUM(unsigned, CBLIndexUpdateMode) {
 
 /** Returns a live query with the same parameters. */
 - (CBLLiveQuery*) asLiveQuery;
+
+- (instancetype) init NS_UNAVAILABLE;
 
 @end
 
@@ -175,6 +172,10 @@ typedef NS_ENUM(unsigned, CBLIndexUpdateMode) {
     If nil, the last execution of the query was successful. */
 @property (readonly, nullable) NSError* lastError;
 
+/** Call this method to notify that the query parameters have been changed, the CBLLiveQuery object
+    should re-run the query. */
+- (void) queryOptionsChanged;
+
 @end
 
 
@@ -197,9 +198,6 @@ typedef NS_ENUM(unsigned, CBLIndexUpdateMode) {
 /** Random access to a row in the result */
 - (CBLQueryRow*) rowAtIndex: (NSUInteger)index;
 
-/** Resets the enumeration so the next call to -nextObject or -nextRow will return the first row. */
-- (void) reset;
-
 /** Re-sorts the rows based on the given sort descriptors.
     This operation requires that all rows be loaded into memory, so you can't have previously
     called -nextObject, -nextRow or for...in on this enumerator. (But it's fine to use them
@@ -214,6 +212,9 @@ typedef NS_ENUM(unsigned, CBLIndexUpdateMode) {
     A limited form of array indexing is supported, so you can refer to "key[1]" or "value[0]" if
     the key or value are arrays. This only works with indexes from 0 to 3. */
 - (void) sortUsingDescriptors: (NSArray*)sortDescriptors;
+
+- (instancetype) init NS_UNAVAILABLE;
+- (void) reset  __attribute__((deprecated("call allObjects and iterate that array multiple times")));
 
 @end
 
@@ -259,7 +260,7 @@ typedef NS_ENUM(unsigned, CBLIndexUpdateMode) {
     (You can still get the document properties via the .document property, of course. But it
     takes a separate call to the database. So if you're doing it for every row, using
     .prefetch and .documentProperties is faster.) */
-@property (readonly, nullable) NSDictionary* documentProperties;
+@property (readonly, nullable) CBLJSONDict* documentProperties;
 
 /** If this row's key is an array, returns the item at that index in the array.
     If the key is not an array, index=0 will return the key itself.
@@ -281,11 +282,11 @@ typedef NS_ENUM(unsigned, CBLIndexUpdateMode) {
     The first object in the array will be the default "winning" revision that shadows the others.
     This is only valid in an allDocuments query whose allDocsMode is set to kCBLShowConflicts
     or kCBLOnlyConflicts; otherwise it returns nil. */
-@property (readonly, nullable) NSArray* conflictingRevisions;
+@property (readonly, nullable) CBLArrayOf(CBLRevision*)* conflictingRevisions;
+
+- (instancetype) init NS_UNAVAILABLE;
 
 @end
 
 
-#if __has_feature(nullability)
-#pragma clang assume_nonnull end
-#endif
+NS_ASSUME_NONNULL_END

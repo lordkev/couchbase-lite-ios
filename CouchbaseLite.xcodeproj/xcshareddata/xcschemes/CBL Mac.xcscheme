@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Scheme
-   LastUpgradeVersion = "0600"
+   LastUpgradeVersion = "0630"
    version = "2.0">
    <BuildAction
       parallelizeBuildables = "YES"
@@ -37,10 +37,11 @@
       </BuildActionEntries>
    </BuildAction>
    <TestAction
+      buildConfiguration = "Debug"
       selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
       selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
-      shouldUseLaunchSchemeArgsEnv = "YES"
-      buildConfiguration = "Debug">
+      shouldUseLaunchSchemeArgsEnv = "NO"
+      enableAddressSanitizer = "YES">
       <Testables>
          <TestableReference
             skipped = "NO">
@@ -50,6 +51,16 @@
                BuildableName = "CBForest Tests.xctest"
                BlueprintName = "CBForest Tests"
                ReferencedContainer = "container:vendor/CBForest/CBForest.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
+         <TestableReference
+            skipped = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "27187EAE1B03C03D0057D7D2"
+               BuildableName = "BLIPTests-Mac.xctest"
+               BlueprintName = "BLIPTests-Mac"
+               ReferencedContainer = "container:vendor/BLIP/BLIP.xcodeproj">
             </BuildableReference>
          </TestableReference>
          <TestableReference
@@ -72,16 +83,41 @@
             ReferencedContainer = "container:CouchbaseLite.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
+      <CommandLineArguments>
+         <CommandLineArgument
+            argument = "-TestNewReplicator YES"
+            isEnabled = "NO">
+         </CommandLineArgument>
+         <CommandLineArgument
+            argument = "-Log YES"
+            isEnabled = "YES">
+         </CommandLineArgument>
+         <CommandLineArgument
+            argument = "-LogSyncVerbose YES"
+            isEnabled = "NO">
+         </CommandLineArgument>
+      </CommandLineArguments>
+      <EnvironmentVariables>
+         <EnvironmentVariable
+            key = "MallocScribble"
+            value = ""
+            isEnabled = "YES">
+         </EnvironmentVariable>
+      </EnvironmentVariables>
+      <AdditionalOptions>
+      </AdditionalOptions>
    </TestAction>
    <LaunchAction
+      buildConfiguration = "Debug"
       selectedDebuggerIdentifier = ""
       selectedLauncherIdentifier = "Xcode.IDEFoundation.Launcher.PosixSpawn"
       launchStyle = "0"
       useCustomWorkingDirectory = "NO"
-      buildConfiguration = "Debug"
       ignoresPersistentStateOnLaunch = "NO"
       debugDocumentVersioning = "YES"
       debugXPCServices = "NO"
+      enableAddressSanitizer = "YES"
+      debugServiceExtension = "internal"
       allowLocationSimulation = "YES">
       <MacroExpansion>
          <BuildableReference
@@ -118,10 +154,10 @@
       </AdditionalOptions>
    </LaunchAction>
    <ProfileAction
+      buildConfiguration = "Release"
       shouldUseLaunchSchemeArgsEnv = "YES"
       savedToolIdentifier = ""
       useCustomWorkingDirectory = "NO"
-      buildConfiguration = "Release"
       debugDocumentVersioning = "YES">
       <MacroExpansion>
          <BuildableReference

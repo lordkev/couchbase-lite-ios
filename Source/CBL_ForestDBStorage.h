@@ -3,7 +3,7 @@
 //  CouchbaseLite
 //
 //  Created by Jens Alfke on 1/14/15.
-//
+//  Copyright (c) 2015 Couchbase, Inc. All rights reserved.
 //
 
 #import "CBL_Storage.h"
@@ -13,9 +13,13 @@
 
 @property (nonatomic, readonly) NSString* directory;
 @property (nonatomic, readonly) void* forestDatabase; // really forestdb::Database*
+@property (nonatomic) CBLSymmetricKey* encryptionKey;
 
 /** Loads revision given its sequence. Assumes the given docID is valid. */
-- (CBL_MutableRevision*) getDocumentWithID: (NSString*)docID
-                                  sequence: (SequenceNumber)sequence
-                                    status: (CBLStatus*)outStatus;
+- (NSDictionary*) getBodyWithID: (NSString*)docID
+                       sequence: (SequenceNumber)sequence
+                         status: (CBLStatus*)outStatus;
+
+- (void) forgetViewStorageNamed: (NSString*)viewName;
+
 @end

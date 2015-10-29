@@ -41,6 +41,7 @@
 @property NSArray* dates;
 @property NSArray* others;
 @property NSDictionary* dict;
+@property id untypedObject;
 
 @property TestSubModel* subModel;
 @property TestMutableSubModel* mutableSubModel;
@@ -49,6 +50,8 @@
 @property int Capitalized;
 
 @property unsigned reloadCount;
+
+@property NSArray* otherModels; // inverse of TestOtherModel.model
 @end
 
 
@@ -66,6 +69,13 @@
 @interface CBL_TestAwakeInitModel : CBLModel
 @property BOOL didAwake;
 @end
+
+
+@interface TestOtherModel : CBLModel
+@property int number;
+@property TestModel* model;
+@end
+
 
 #pragma mark - TEST CASES:
 
@@ -160,6 +170,7 @@
     CBLDocument* doc2 = [db createDocument];
     Assert([doc2 putProperties: props error: NULL]);
     TestModel* model2 = [TestModel modelForDocument: doc2];
+    Assert(!model2.isNew);
     AssertEqual(model2.subModel, name);
 
     // Now test array of encodable objects:
@@ -299,6 +310,7 @@
         model.dates = dates;
         model.decimal = decimal;
         model.url = url;
+        model.untypedObject = @"this is an id";
 
         Assert(model.isNew);
         Assert(model.needsSave);
@@ -311,7 +323,8 @@
                                                 @"dates": @[@"2013-06-12T23:40:52.000Z",
                                                             @"2013-06-13T17:32:01.000Z"],
                                                 @"decimal": @"12345.6789",
-                                                @"url": @"http://bogus"}));
+                                                @"url": @"http://bogus",
+                                                @"untypedObject": @"this is an id"}));
 
         TestModel* model2 = [TestModel modelForNewDocumentInDatabase: db];
         model2ID = model2.document.documentID;
@@ -332,12 +345,14 @@
         AssertEqual(model.url, url);
         AssertEq(model.other, model3);
         AssertEqual(model.others, (@[model2, model3]));
+        AssertEqual(model.untypedObject, @"this is an id");
 
         // Save it and make sure the save didn't trigger a reload:
         AssertEqual(db.unsavedModels, @[model]);
         NSError* error;
         Assert([db saveAllModels: &error]);
         AssertEq(model.reloadCount, 0u);
+        Assert(!model.isNew);
 
         // Verify that the document got updated correctly:
         NSMutableDictionary* props = [model.document.properties mutableCopy];
@@ -349,6 +364,7 @@
                                @"dates": @[@"2013-06-12T23:40:52.000Z", @"2013-06-13T17:32:01.000Z"],
                                @"decimal": @"12345.6789",
                                @"url": @"http://bogus",
+                               @"untypedObject": @"this is an id",
                                @"other": model3.document.documentID,
                                @"others": @[model2.document.documentID, model3.document.documentID],
                                @"_id": props[@"_id"],
@@ -385,6 +401,7 @@
         [self reopenTestDB];
         CBLDocument* doc = [db documentWithID: modelID];
         TestModel* modelAgain = [TestModel modelForDocument: doc];
+        Assert(!modelAgain.isNew);
         AssertEq(modelAgain.number, 4321);
         AssertEqual(modelAgain.str, @"LEET");
         AssertEqual(modelAgain.strings, (@[@"fee", @"fie", @"foe", @"fum"]));
@@ -558,15 +575,58 @@
     Assert([model save: &error], @"Save of new model object failed: %@", error);
 }
 
+
+- (void) test00_InverseRelation {
+    // Create two TestModels as targets for the 'model' relation:
+    [db.modelFactory registerClass: [TestModel class] forDocumentType: @"test"];
+    [db.modelFactory registerClass: [TestOtherModel class] forDocumentType: @"other"];
+    TestModel* model1 = [TestModel modelForNewDocumentInDatabase: db];
+    model1.number = 1;
+    TestModel* model2 = [TestModel modelForNewDocumentInDatabase: db];
+    model2.number = 2;
+
+    // Create 100 TestOtherModels whose 'model' properties point to the above TestModels:
+    for (int i = 0; i < 50; i++) {
+        TestOtherModel* other = [TestOtherModel modelForNewDocumentInDatabase: db];
+        other.number = i;
+        other.model = (i % 2) ? model1 : model2;
+    }
+
+    NSError* error;
+    Assert([db saveAllModels: &error], @"Save failed: %@", error);
+
+    // Now query:
+    NSArray* result1 = model1.otherModels;
+    AssertEq(result1.count, 25u);
+    for (TestOtherModel* m in result1) {
+        AssertEq([m class], [TestOtherModel class]);
+        AssertEq(m.number % 2, 1);
+    }
+    NSArray* result2 = model2.otherModels;
+    AssertEq(result2.count, 25u);
+    for (TestOtherModel* m in result2) {
+        AssertEq([m class], [TestOtherModel class]);
+        AssertEq(m.number % 2, 0);
+    }
+}
+
+
+- (void) test00_IsNew {
+    // https://github.com/couchbase/couchbase-lite-ios/issues/909
+    CBLDocument* doc = db[@"somedoc"];
+    CBLModel *model = [TestModel modelForDocument: doc];
+    Assert(model.isNew);
+}
+
 @end
 
 
 @implementation TestModel
 
 @dynamic number, uInt, sInt16, uInt16, sInt8, uInt8, nsInt, nsUInt, sInt32, uInt32;
-@dynamic sInt64, uInt64, boolean, boolObjC, floaty, doubly, dict;
+@dynamic sInt64, uInt64, boolean, boolObjC, floaty, doubly, dict, untypedObject;
 @dynamic str, data, date, decimal, url, other, strings, dates, others, Capitalized;
-@dynamic subModel, subModels, mutableSubModel;
+@dynamic subModel, subModels, mutableSubModel, otherModels;
 @synthesize reloadCount;
 
 - (void) didLoadFromDocument {
@@ -584,6 +644,14 @@
 
 + (Class) subModelsItemClass {
     return [TestSubModel class];
+}
+
++ (Class) otherModelsItemClass {
+    return [TestOtherModel class];
+}
+
++ (NSString*) otherModelsInverseRelation {
+    return @"model";
 }
 
 @end
@@ -653,6 +721,10 @@
     self.didAwake = YES;
 }
 
+@end
+
+@implementation TestOtherModel
+@dynamic number, model;
 @end
 
 

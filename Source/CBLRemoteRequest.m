@@ -15,16 +15,18 @@
 
 #import "CBLRemoteRequest.h"
 #import "CBLAuthorizer.h"
+#import "CBLClientCertAuthorizer.h"
 #import "CBLMisc.h"
 #import "CBLStatus.h"
 #import "CBL_BlobStore.h"
 #import "CBLDatabase.h"
-#import "CBL_Replicator.h"
+#import "CBLRestReplicator.h"
 #import "CollectionUtils.h"
 #import "Logging.h"
 #import "Test.h"
 #import "MYURLUtils.h"
-#import "GTMNSData+zlib.h"
+#import "CBLGZip.h"
+#import "CBLCookieStorage.h"
 
 
 // Max number of retry attempts for a transient failure, and the backoff time formula
@@ -32,25 +34,27 @@
 #define RetryDelay(COUNT) (4 << (COUNT))        // COUNT starts at 0
 
 
+typedef enum {
+    kNoAuthChallenge,
+    kTryAuthorizer,
+    kTryProposed,
+    kFindCredential,
+    kGiveUp
+} AuthPhase;
+
+
 @implementation CBLRemoteRequest
-
-
-@synthesize delegate=_delegate, responseHeaders=_responseHeaders;
-
-
-+ (NSString*) userAgentHeader {
-    static NSString* sUserAgent;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-#if TARGET_OS_IPHONE
-        const char* platform = "iOS";
-#else
-        const char* platform = "Mac OS X";
-#endif
-        sUserAgent = $sprintf(@"CouchbaseLite/%s (%s)", CBL_VERSION_STRING, platform);
-    });
-    return sUserAgent;
+{
+    AuthPhase _authPhase;
+    NSURLCredential* _proposedCredential;
 }
+
+
+@synthesize delegate=_delegate, responseHeaders=_responseHeaders, cookieStorage=_cookieStorage;
+@synthesize autoRetry = _autoRetry;
+#if DEBUG
+@synthesize debugAlwaysTrust=_debugAlwaysTrust;
+#endif
 
 
 - (instancetype) initWithMethod: (NSString*)method
@@ -62,12 +66,13 @@
     self = [super init];
     if (self) {
         _onCompletion = [onCompletion copy];
+        _autoRetry = YES;
         _request = [[NSMutableURLRequest alloc] initWithURL: url];
         _request.HTTPMethod = method;
         _request.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
         
         // Add headers.
-        [_request setValue: [[self class] userAgentHeader] forHTTPHeaderField:@"User-Agent"];
+        [_request setValue: [CBL_ReplicatorSettings userAgentHeader] forHTTPHeaderField:@"User-Agent"];
         [requestHeaders enumerateKeysAndObjectsUsingBlock:^(id key, id value, BOOL *stop) {
             [_request setValue:value forHTTPHeaderField:key];
             // If app explicitly wants to set a cookie, we have to stop NSURLRequest from using its
@@ -75,7 +80,7 @@
             if ([key caseInsensitiveCompare: @"Cookie"] == 0)
                 _request.HTTPShouldHandleCookies = NO;
         }];
-        
+
         [self setupRequest: _request withBody: body];
 
     }
@@ -99,8 +104,16 @@
 - (void) setAuthorizer: (id<CBLAuthorizer>)authorizer {
     if (_authorizer != authorizer) {
         _authorizer = authorizer;
-        [_request setValue: [authorizer authorizeURLRequest: _request forRealm: nil]
-        forHTTPHeaderField: @"Authorization"];
+        [$castIfProtocol(CBLCustomHeadersAuthorizer, _authorizer) authorizeURLRequest: _request];
+    }
+}
+
+- (void) setCookieStorage:(CBLCookieStorage *)cookieStorage {
+    if (_cookieStorage != cookieStorage) {
+        _cookieStorage = cookieStorage;
+        if (_request.HTTPShouldHandleCookies) {
+            [_cookieStorage addCookieHeaderToRequest: _request];
+        }
     }
 }
 
@@ -114,7 +127,7 @@
     NSData* body = _request.HTTPBody;
     if (body.length < 100 || [_request valueForHTTPHeaderField: @"Content-Encoding"] != nil)
         return NO;
-    NSData* encoded = [NSData gtm_dataByGzippingData: body];
+    NSData* encoded = [CBLGZip dataByCompressingData: body];
     if (encoded.length >= body.length)
         return NO;
     _request.HTTPBody = encoded;
@@ -132,6 +145,7 @@
     if (!_request)
         return;     // -clearConnection already called
     _responseHeaders = nil;
+    _authPhase = kNoAuthChallenge;
     LogTo(RemoteRequest, @"%@: Starting...", self);
     Assert(!_connection);
     _connection = [NSURLConnection connectionWithRequest: _request delegate: self];
@@ -140,9 +154,7 @@
 
 - (void) clearConnection {
     _request = nil;
-    if (_connection) {
-        _connection = nil;
-    }
+    _connection = nil;
 }
 
 
@@ -195,7 +207,8 @@
     if (!_connection)
         return;
     [_connection cancel];
-    [self connection: _connection didFailWithError: CBLStatusToNSError(status, _request.URL)];
+    [self connection: _connection
+          didFailWithError: CBLStatusToNSErrorWithInfo(status, nil, _request.URL, nil)];
 }
 
 
@@ -203,8 +216,7 @@
     // Note: This assumes all requests are idempotent, since even though we got an error back, the
     // request might have succeeded on the remote server, and by retrying we'd be issuing it again.
     // PUT and POST requests aren't generally idempotent, but the ones sent by the replicator are.
-    
-    if (_retryCount >= kMaxRetries)
+    if (!_autoRetry || _retryCount >= kMaxRetries)
         return NO;
     NSTimeInterval delay = RetryDelay(_retryCount);
     ++_retryCount;
@@ -215,21 +227,46 @@
 
 
 - (bool) retryWithCredential {
-    if (_authorizer || _challenged)
+    if (!_autoRetry || _authorizer || _challenged)
         return false;
     _challenged = true;
-    NSURLCredential* cred = [_request.URL my_credentialForRealm: nil
-                                           authenticationMethod: NSURLAuthenticationMethodHTTPBasic];
-    if (!cred) {
+    CBLPasswordAuthorizer *auth = [[CBLPasswordAuthorizer alloc] initWithURL: _request.URL];
+    if (!auth) {
         LogTo(RemoteRequest, @"Got 401 but no stored credential found (with nil realm)");
         return false;
     }
 
     [_connection cancel];
-    self.authorizer = [[CBLBasicAuthorizer alloc] initWithCredential: cred];
-    LogTo(RemoteRequest, @"%@ retrying with %@", self, _authorizer);
+    self.authorizer = auth;
+    LogTo(RemoteRequest, @"%@ retrying with %@", self, auth);
     [self startAfterDelay: 0.0];
     return true;
+}
+
+
+- (NSURLCredential*) nextCredentialToTry: (NSURLAuthenticationChallenge*)challenge {
+    NSURLCredential* cred;
+    do {
+        switch (++_authPhase) {
+            case kTryAuthorizer:
+                _proposedCredential = challenge.proposedCredential;
+                cred = $castIf(CBLPasswordAuthorizer, _authorizer).credential;
+                break;
+            case kTryProposed:
+                cred = _proposedCredential;
+                _proposedCredential = nil;
+                break;
+            case kFindCredential: {
+                NSURLProtectionSpace* space = challenge.protectionSpace;
+                cred = [_request.URL my_credentialForRealm: space.realm
+                                      authenticationMethod: space.authenticationMethod];
+                break;
+            }
+            default:
+                return nil; // give up
+        }
+    } while (cred == nil || (cred.user && !cred.hasPassword));
+    return cred;
 }
 
 
@@ -270,26 +307,22 @@ void CBLWarnUntrustedCert(NSString* host, SecTrustRef trust) {
     if ($equal(authMethod, NSURLAuthenticationMethodHTTPBasic) ||
             $equal(authMethod, NSURLAuthenticationMethodHTTPDigest)) {
         _challenged = true;
-        _authorizer = nil;
-        if (challenge.previousFailureCount <= 1) {
-            // On basic auth challenge, use proposed credential on first attempt. On second attempt
-            // or if there's no proposed credential, look one up. After that, give up.
-            NSURLCredential* cred = challenge.proposedCredential;
-            if (cred == nil || challenge.previousFailureCount > 0) {
-                cred = [_request.URL my_credentialForRealm: space.realm
-                                      authenticationMethod: authMethod];
-            }
-            if (cred) {
-                LogTo(RemoteRequest, @"    challenge: useCredential: %@", cred);
-                [sender useCredential: cred forAuthenticationChallenge:challenge];
-                // Update my authorizer so my owner (the replicator) can pick it up when I'm done
-                _authorizer = [[CBLBasicAuthorizer alloc] initWithCredential: cred];
-                return;
-            }
+        NSURLCredential* cred = [self nextCredentialToTry: challenge];
+        if (cred) {
+            LogTo(RemoteRequest, @"    challenge: (phase %d) useCredential: %@", _authPhase, cred);
+            [sender useCredential: cred forAuthenticationChallenge:challenge];
+            // Update my authorizer so my owner (the replicator) can pick it up when I'm done
+            if (_authPhase > kTryAuthorizer)
+                _authorizer = [[CBLPasswordAuthorizer alloc] initWithCredential: cred];
+            return;
+        } else {
+            _authorizer = nil;
+            LogTo(RemoteRequest, @"    challenge: (phase %d) continueWithoutCredential", _authPhase);
+            [sender continueWithoutCredentialForAuthenticationChallenge: challenge];
         }
-        LogTo(RemoteRequest, @"    challenge: continueWithoutCredential");
-        [sender continueWithoutCredentialForAuthenticationChallenge: challenge];
+
     } else if ($equal(authMethod, NSURLAuthenticationMethodServerTrust)) {
+        // Verify the _server's_ SSL certificate:
         SecTrustRef trust = space.serverTrust;
         BOOL ok;
         if (_delegate)
@@ -298,6 +331,16 @@ void CBLWarnUntrustedCert(NSString* host, SecTrustRef trust) {
             SecTrustResultType result;
             ok = (SecTrustEvaluate(trust, &result) == noErr) &&
                     (result==kSecTrustResultProceed || result==kSecTrustResultUnspecified);
+#if DEBUG
+            if (!ok && _debugAlwaysTrust) {
+                ok = YES;
+                CFDataRef exception = SecTrustCopyExceptions(trust);
+                if (exception) {
+                    SecTrustSetExceptions(trust, exception);
+                    CFRelease(exception);
+                }
+            }
+#endif
         }
         if (ok) {
             LogTo(RemoteRequest, @"    useCredential for trust: %@", trust);
@@ -308,6 +351,23 @@ void CBLWarnUntrustedCert(NSString* host, SecTrustRef trust) {
             LogTo(RemoteRequest, @"    challenge: fail (untrusted cert)");
             [sender continueWithoutCredentialForAuthenticationChallenge: challenge];
         }
+
+    } else if ($equal(authMethod, NSURLAuthenticationMethodClientCertificate)) {
+        // Request for SSL client cert:
+        if (challenge.previousFailureCount == 0) {
+            NSURLCredential* cred = $castIf(CBLClientCertAuthorizer, _authorizer).credential;
+            if (cred) {
+                LogTo(RemoteRequest, @"    challenge: sending SSL client cert");
+                [sender useCredential: cred forAuthenticationChallenge:challenge];
+                return;
+            }
+            LogTo(RemoteRequest, @"    challenge: no SSL client cert");
+        } else {
+            _authorizer = nil;
+            LogTo(RemoteRequest, @"    challenge: SSL client cert rejected");
+        }
+        [sender continueWithoutCredentialForAuthenticationChallenge: challenge];
+        
     } else {
         LogTo(RemoteRequest, @"    challenge: performDefaultHandling");
         [sender performDefaultHandlingForAuthenticationChallenge: challenge];
@@ -318,6 +378,10 @@ void CBLWarnUntrustedCert(NSString* host, SecTrustRef trust) {
 - (void)connection:(NSURLConnection *)connection didReceiveResponse:(NSURLResponse *)response {
     _status = (int) ((NSHTTPURLResponse*)response).statusCode;
     _responseHeaders = ((NSHTTPURLResponse*)response).allHeaderFields;
+
+    if (_cookieStorage)
+        [_cookieStorage setCookieFromResponse: (NSHTTPURLResponse*)response];
+
     LogTo(RemoteRequest, @"%@: Got response, status %d", self, _status);
     if (_status == 401) {
         // CouchDB says we're unauthorized but it didn't present a 'WWW-Authenticate' header
@@ -325,7 +389,7 @@ void CBLWarnUntrustedCert(NSString* host, SecTrustRef trust) {
         if ([self retryWithCredential])
             return;
     }
-    
+
 #if DEBUG
     if (!CBLStatusIsError(_status)) {
         // By setting the user default "CBLFakeFailureRate" to a number between 0.0 and 1.0,
@@ -352,12 +416,13 @@ void CBLWarnUntrustedCert(NSString* host, SecTrustRef trust) {
     // The redirected request needs to be authorized again:
     if (![request valueForHTTPHeaderField: @"Authorization"]) {
         NSMutableURLRequest* nuRequest = [request mutableCopy];
-        NSString* auth;
-        if (_authorizer)
-            auth = [_authorizer authorizeURLRequest: nuRequest forRealm: nil];
-        else
-            auth = [_request valueForHTTPHeaderField: @"Authorization"];
-        [nuRequest setValue: auth forHTTPHeaderField: @"Authorization"];
+        id<CBLCustomHeadersAuthorizer> customAuth = $castIfProtocol(CBLCustomHeadersAuthorizer, _authorizer);
+        if (customAuth) {
+            [customAuth authorizeURLRequest: nuRequest];
+        } else {
+            NSString* authHeader = [_request valueForHTTPHeaderField: @"Authorization"];
+            [nuRequest setValue: authHeader forHTTPHeaderField: @"Authorization"];
+        }
         request = nuRequest;
     }
     return request;
@@ -432,7 +497,7 @@ void CBLWarnUntrustedCert(NSString* host, SecTrustRef trust) {
         if (!result) {
             Warn(@"%@: %@ %@ returned unparseable data '%@'",
                  self, _request.HTTPMethod, _request.URL, [_jsonBuffer my_UTF8ToString]);
-            error = CBLStatusToNSError(kCBLStatusUpstreamError, _request.URL);
+            error = CBLStatusToNSErrorWithInfo(kCBLStatusUpstreamError, nil, _request.URL, nil);
         }
     } else {
         result = $dict();

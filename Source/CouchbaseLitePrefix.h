@@ -55,11 +55,23 @@ extern "C" {
 #define GCDAsyncSocketSSLProtocolVersionMax CBL_GCDAsyncSocketSSLProtocolVersionMax
 #define GCDAsyncSocketSSLProtocolVersionMin CBL_GCDAsyncSocketSSLProtocolVersionMin
 
+#define GCDAsyncSocketManuallyEvaluateTrust CBL_GCDAsyncSocketManuallyEvaluateTrust
+#define GCDAsyncSocketUseCFStreamForTLS     CBL_GCDAsyncSocketUseCFStreamForTLS
+#define GCDAsyncSocketSSLPeerID             CBL_GCDAsyncSocketSSLPeerID
+#define GCDAsyncSocketSSLSessionOptionFalseStart        CBL_GCDAsyncSocketSSLSessionOptionFalseStart
+#define GCDAsyncSocketSSLSessionOptionSendOneByteRecord CBL_GCDAsyncSocketSSLSessionOptionSendOneByteRecord
+
 // Rename the CocoaLumberjack classes to avoid collisions:
 #define DDLog                       CBL_DDLog
 #define DDLogMessage                CBL_DDLogMessage
 #define DDAbstractLogger            CBL_DDAbstractLogger
 #define DDLoggerNode                CBL_DDLoggerNode
+#define DDExtractFileNameWithoutExtension CBL_DDExtractFileNameWithoutExtension
+#define DDUnionRange                CBL_DDUnionRange
+#define DDIntersectionRange         CBL_DDIntersectionRange
+#define DDStringFromRange           CBL_DDStringFromRange
+#define DDRangeFromString           CBL_DDRangeFromString
+#define DDRangeCompare              CBL_DDRangeCompare
 
 // Rename the CocoaHTTPServer classes to avoid collisions:
 #define HTTPAsyncFileResponse       CBL_HTTPAsyncFileResponse
@@ -80,7 +92,7 @@ extern "C" {
 #define OARequestParameter          CBL_OARequestParameter
 #define OAToken                     CBL_OAToken
 
-// Rename the WebScket classes to avoid collisions:
+// Rename the WebSocket classes to avoid collisions:
 #define WebSocket                   CBL_WebSocket
 #define WebSocketClient             CBL_WebSocketClient
 #define WebSocketHTTPLogic          CBL_WebSocketHTTPLogic

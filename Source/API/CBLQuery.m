@@ -20,6 +20,7 @@
 #import "CBLDatabase.h"
 #import "CBL_Server.h"
 #import "CBLMisc.h"
+#import "CBLInternal.h"
 #import "MYBlockUtils.h"
 
 
@@ -59,6 +60,7 @@
 
 // A nil view refers to 'all documents'
 - (instancetype) initWithDatabase: (CBLDatabase*)database view: (CBLView*)view {
+    Assert(database);
     self = [super init];
     if (self) {
         _database = database;
@@ -127,7 +129,7 @@
             endKeyDocID=_endKeyDocID, indexUpdateMode=_indexUpdateMode, mapOnly=_mapOnly,
             database=_database, allDocsMode=_allDocsMode, sortDescriptors=_sortDescriptors,
             inclusiveStart=_inclusiveStart, inclusiveEnd=_inclusiveEnd, postFilter=_postFilter,
-            prefixMatchLevel=_prefixMatchLevel;
+            filterBlock=_filterBlock, prefixMatchLevel=_prefixMatchLevel;
 
 
 - (NSString*) description {
@@ -177,8 +179,6 @@
     options->fullTextSnippets = _fullTextSnippets;
     options->fullTextRanking = _fullTextRanking;
     options->bbox = (_isGeoQuery ? &_boundingBox : NULL);
-    options->skip = (unsigned)_skip;
-    options->limit = (unsigned)_limit;
     options->reduce = !_mapOnly;
     options->reduceSpecified = YES;
     options->groupLevel = (unsigned)_groupLevel;
@@ -189,8 +189,16 @@
     options->indexUpdateMode = _indexUpdateMode;
     options->indexUpdateMode = _indexUpdateMode;
 
-    NSPredicate* postFilter = _postFilter;
-    if (postFilter) {
+    if (_sortDescriptors.count == 0) {
+        options->skip = (unsigned)_skip;
+        options->limit = (unsigned)_limit;
+        // If using sortDescriptors, have to apply skip+limit later, after sorting
+    }
+
+    if (_filterBlock) {
+        options.filter = _filterBlock;
+    } else if (_postFilter) {
+        NSPredicate* postFilter = _postFilter;
         CBLDatabase* database = _database;
         options.filter = ^(CBLQueryRow* row) {
             row.database = database;    //FIX: What if this is called on another thread??
@@ -213,16 +221,17 @@
                                                   lastSequence: &lastSequence
                                                         status: &status];
     if (!iterator) {
-        if (outError)
-            *outError = CBLStatusToNSError(status, nil);
+        CBLStatusToOutNSError(status, outError);
         return nil;
     }
     CBLQueryEnumerator* result = [[CBLQueryEnumerator alloc] initWithDatabase: _database
                                                                          view: _view
                                                                sequenceNumber: lastSequence
                                                                      iterator: iterator];
-    if (_sortDescriptors)
-        [result sortUsingDescriptors: _sortDescriptors];
+    if (_sortDescriptors.count > 0)
+        [result sortUsingDescriptors: _sortDescriptors
+                                skip: _skip
+                               limit: _limit];
     return result;
 }
 
@@ -267,16 +276,19 @@
             NSError* error = nil;
             CBLQueryEnumerator* e = nil;
             if (rows) {
+                // Associate the query rows with this view, not the background-thread one:
                 for (CBLQueryRow* row in rows)
-                    row.database = _database;
+                    [row moveToDatabase: _database view: _view];
                 e = [[CBLQueryEnumerator alloc] initWithDatabase: _database
                                                             view: _view
                                                   sequenceNumber: lastSequence
                                                             rows: rows];
-                if (_sortDescriptors)
-                    [e sortUsingDescriptors: _sortDescriptors];
+                if (_sortDescriptors.count > 0)
+                    [e sortUsingDescriptors: _sortDescriptors
+                                       skip: _skip
+                                      limit: _limit];
             } else if (CBLStatusIsError(status)) {
-                error = CBLStatusToNSError(status, nil);
+                error = CBLStatusToNSError(status);
             }
             onComplete(e, error);
         }];
@@ -407,6 +419,8 @@
 
 
 - (void) update {
+    _willUpdate = NO;
+
     SequenceNumber lastSequence = self.database.lastSequenceNumber;
     if (_rows && _lastSequence >= lastSequence) {
         return; // db hasn't changed since last query
@@ -420,11 +434,14 @@
         return;
     }
 
-    _willUpdate = NO;
     _updateAgain = NO;
     _isUpdatingAtSequence = lastSequence;
     _lastUpdatedAt = CFAbsoluteTimeGetCurrent();
-    [self runAsyncIfChangedSince: _rows.sequenceNumber
+
+    // Reset sequence number in the current result's sequence number when
+    // forcing the query to re-run as setting _lastSequence to zero.
+    SequenceNumber curRowsSeq = _lastSequence != 0 ? _rows.sequenceNumber : 0;
+    [self runAsyncIfChangedSince: curRowsSeq
                       onComplete: ^(CBLQueryEnumerator *rows, NSError* error) {
         // Async update finished:
         _isUpdatingAtSequence = 0;
@@ -448,6 +465,11 @@
     [self start];
     return [self.database waitFor: ^BOOL { return _rows != nil || _lastError != nil; }]
         && _rows != nil;
+}
+
+ 
+- (void) queryOptionsChanged {
+    [self viewChanged: nil];
 }
 
 

@@ -55,8 +55,11 @@
 - (CBL_Revision*) putDoc: (NSDictionary*)props {
     CBL_Revision* rev = [[CBL_Revision alloc] initWithProperties: props];
     CBLStatus status;
-    CBL_Revision* result = [db putRevision: [rev mutableCopy] prevRevisionID: nil allowConflict: NO status: &status];
+    NSError* error;
+    CBL_Revision* result = [db putRevision: [rev mutableCopy] prevRevisionID: nil allowConflict: NO
+                                    status: &status error: &error];
     Assert(status < 300, @"Status %d from putDoc(%@)", status, props);
+    AssertNil(error);
     return result.revisionByAddingBasicMetadata;
 }
 
@@ -71,7 +74,6 @@
     return docs;
 }
 
-#if 0 //FIX: REIMPLEMENT GEO
 static NSDictionary* mkGeoPoint(double x, double y) {
     return CBLGeoPointToJSON((CBLGeoPoint){x,y});
 }
@@ -101,7 +103,6 @@ static NSDictionary* mkGeoRect(double x0, double y0, double x1, double y1) {
                                         mkGeoRect(-115,-10, -90, 12)})]];
     return docs;
 }
-#endif
 
 
 - (CBLView*) createViewNamed: (NSString*)name {
@@ -110,6 +111,7 @@ static NSDictionary* mkGeoRect(double x0, double y0, double x1, double y1) {
         Assert(doc[@"_id"] != nil, @"Missing _id in %@", doc);
         Assert(doc[@"_rev"] != nil, @"Missing _rev in %@", doc);
         Assert([doc[@"_local_seq"] isKindOfClass: [NSNumber class]], @"Invalid _local_seq in %@", doc);
+        Assert(![doc[@"_id"] hasPrefix:@"_design/"], @"Shouldn't index the design doc: %@", doc);
         if (doc[@"key"])
             emit(doc[@"key"], nil);
         if (doc[@"geoJSON"])
@@ -153,16 +155,26 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
     [self putDoc: $dict({@"_id", @"_design/foo"})];
     [self putDoc: $dict({@"clef", @"quatre"})];
     
-    CBLView* view = [self createView];
+    CBLView* view = [db viewNamed: @"aview"];
+    [view setMapBlock: MAPBLOCK({
+        Assert(doc[@"_id"] != nil, @"Missing _id in %@", doc);
+        Assert(doc[@"_rev"] != nil, @"Missing _rev in %@", doc);
+        Assert([doc[@"_local_seq"] isKindOfClass: [NSNumber class]], @"Invalid _local_seq in %@", doc);
+        Assert(![doc[@"_id"] hasPrefix:@"_design/"], @"Shouldn't index the design doc: %@", doc);
+        if (doc[@"key"])
+            emit(doc[@"key"], @([doc[@"key"] length]));
+        if (doc[@"geoJSON"])
+            emit(CBLGeoJSONKey(doc[@"geoJSON"]), nil);
+    }) reduceBlock: NULL version: @"1"];
 
     Assert(view.stale);
     AssertEq([view updateIndex], kCBLStatusOK);
     
     NSArray* dump = [view.storage dump];
     Log(@"View dump: %@", dump);
-    AssertEqual(dump, $array($dict({@"key", @"\"one\""}, {@"seq", @1}),
-                              $dict({@"key", @"\"three\""}, {@"seq", @3}),
-                              $dict({@"key", @"\"two\""}, {@"seq", @2}) ));
+    AssertEqual(dump, $array($dict({@"key", @"\"one\""},   {@"value", @"3"}, {@"seq", @1}),
+                             $dict({@"key", @"\"three\""}, {@"value", @"5"}, {@"seq", @3}),
+                             $dict({@"key", @"\"two\""},   {@"value", @"3"}, {@"seq", @2}) ));
     // No-op reindex:
     Assert(!view.stale);
     AssertEq([view updateIndex], kCBLStatusNotModified);
@@ -171,14 +183,19 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
     CBL_MutableRevision* threeUpdated = [[CBL_MutableRevision alloc] initWithDocID: rev3.docID revID: nil deleted:NO];
     threeUpdated.properties = $dict({@"key", @"3hree"});
     CBLStatus status;
-    rev3 = [db putRevision: threeUpdated prevRevisionID: rev3.revID allowConflict: NO status: &status];
+    NSError* error;
+    rev3 = [db putRevision: threeUpdated prevRevisionID: rev3.revID allowConflict: NO
+                    status: &status error: &error];
     Assert(status < 300);
+    AssertNil(error);
 
     CBL_Revision* rev4 = [self putDoc: $dict({@"key", @"four"})];
     
     CBL_Revision* twoDeleted = [[CBL_Revision alloc] initWithDocID: rev2.docID revID: nil deleted:YES];
-    [db putRevision: [twoDeleted mutableCopy] prevRevisionID: rev2.revID allowConflict: NO status: &status];
+    [db putRevision: [twoDeleted mutableCopy] prevRevisionID: rev2.revID allowConflict: NO
+             status: &status error: &error];
     Assert(status < 300);
+    AssertNil(error);
 
     // Reindex again:
     Assert(view.stale);
@@ -186,16 +203,16 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
 
     dump = [view.storage dump];
     Log(@"View dump: %@", dump);
-    AssertEqual(dump, $array($dict({@"key", @"\"3hree\""}, {@"seq", @6}),
-                              $dict({@"key", @"\"four\""}, {@"seq", @7}),
-                              $dict({@"key", @"\"one\""}, {@"seq", @1}) ));
+    AssertEqual(dump, $array($dict({@"key", @"\"3hree\""}, {@"value", @"5"}, {@"seq", @6}),
+                              $dict({@"key", @"\"four\""}, {@"value", @"4"}, {@"seq", @7}),
+                              $dict({@"key", @"\"one\""},  {@"value", @"3"}, {@"seq", @1}) ));
     
     // Now do a real query:
     NSArray* rows = rowsToDicts([view _queryWithOptions: NULL status: &status]);
     AssertEq(status, kCBLStatusOK);
-    AssertEqual(rows, $array( $dict({@"key", @"3hree"}, {@"id", rev3.docID}),
-                               $dict({@"key", @"four"}, {@"id", rev4.docID}),
-                               $dict({@"key", @"one"}, {@"id", rev1.docID}) ));
+    AssertEqual(rows, $array( $dict({@"key", @"3hree"}, {@"value", @5}, {@"id", rev3.docID}),
+                               $dict({@"key", @"four"}, {@"value", @4}, {@"id", rev4.docID}),
+                               $dict({@"key", @"one"},  {@"value", @3}, {@"id", rev1.docID}) ));
     
     [view deleteIndex];
 }
@@ -235,6 +252,13 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
 }
 
 
+static NSArray* sortViews(NSArray *array) {
+    return [array sortedArrayUsingComparator:^NSComparisonResult(CBLView* a, CBLView* b) {
+        return [a.name compare: b.name];
+    }];
+}
+
+
 - (void) test04_IndexMultiple {
     RequireTestCase(Index);
 
@@ -247,12 +271,12 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
 
     [vX forgetMapBlock]; // To reproduce #438
 
-    AssertEqual(v1.viewsInGroup, (@[v1]));
-    AssertEqual(v2.viewsInGroup, (@[v2, v3, vX]));
-    AssertEqual(v3.viewsInGroup, (@[v2, v3, vX]));
-    AssertEqual(vX.viewsInGroup, (@[v2, v3, vX]));
-    AssertEqual(v4.viewsInGroup, (@[v4])); // because GROUP_VIEWS_BY_DEFAULT isn't enabled
-    AssertEqual(v5.viewsInGroup, (@[v5]));
+    AssertEqual(sortViews(v1.viewsInGroup), (@[v1]));
+    AssertEqual(sortViews(v2.viewsInGroup), (@[v2, v3, vX]));
+    AssertEqual(sortViews(v3.viewsInGroup), (@[v2, v3, vX]));
+    AssertEqual(sortViews(vX.viewsInGroup), (@[v2, v3, vX]));
+    AssertEqual(sortViews(v4.viewsInGroup), (@[v4])); // because GROUP_VIEWS_BY_DEFAULT isn't enabled
+    AssertEqual(sortViews(v5.viewsInGroup), (@[v5]));
 
     const int kNDocs = 10;
     for (int i=0; i<kNDocs; i++) {
@@ -296,12 +320,14 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
                               $dict({@"key", @"\"two\""},  {@"seq", @1}) ));
     
     // Create a conflict, won by the new revision:
+    NSError* error;
     NSDictionary* props = $dict({@"_id", @"44444"},
                                 {@"_rev", @"1-ffffff"},  // higher revID, will win conflict
                                 {@"key", @"40ur"});
     CBL_Revision* leaf2 = [[CBL_Revision alloc] initWithProperties: props];
-    CBLStatus status = [db forceInsert: leaf2 revisionHistory: @[] source: nil];
+    CBLStatus status = [db forceInsert: leaf2 revisionHistory: @[] source: nil error: &error];
     Assert(status < 300);
+    AssertNil(error);
     AssertEqual(leaf1.docID, leaf2.docID);
     
     // Update the view -- should contain only the key from the new rev, not the old:
@@ -334,12 +360,14 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
                               $dict({@"key", @"\"two\""},  {@"seq", @1}) ));
     
     // Create a conflict, won by the old revision:
+    NSError* error;
     NSDictionary* props = $dict({@"_id", @"44444"},
                                 {@"_rev", @"1-00"},  // lower revID, will lose conflict
                                 {@"key", @"40ur"});
     CBL_Revision* leaf2 = [[CBL_Revision alloc] initWithProperties: props];
-    CBLStatus status = [db forceInsert: leaf2 revisionHistory: @[] source: nil];
+    CBLStatus status = [db forceInsert: leaf2 revisionHistory: @[] source: nil error: &error];
     Assert(status < 300);
+    AssertNil(error);
     AssertEqual(leaf1.docID, leaf2.docID);
 
     CBL_Revision* winner = [db getDocumentWithID: @"44444" revisionID: nil];
@@ -375,12 +403,14 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
                              $dict({@"key", @"\"two\""},  {@"seq", @1}) ));
     
     // Create a conflict, won by the new revision:
+    NSError* error;
     NSDictionary* props = $dict({@"_id", @"44444"},
                                 {@"_rev", @"1-FFFFFFFF"},  // higher revID, will win conflict
                                 {@"key", @"40ur"});
     CBL_Revision* leaf2 = [[CBL_Revision alloc] initWithProperties: props];
-    CBLStatus status = [db forceInsert: leaf2 revisionHistory: @[] source: nil];
+    CBLStatus status = [db forceInsert: leaf2 revisionHistory: @[] source: nil error: &error];
     Assert(status < 300);
+    AssertNil(error);
     AssertEqual(leaf1.docID, leaf2.docID);
     
     // Update the view -- should contain only the key from the new rev, not the old:
@@ -395,8 +425,10 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
 
     // Delete the new rev, which will make the old one current again:
     CBL_Revision* leaf3 = [[CBL_Revision alloc]initWithDocID:@"44444" revID:@"" deleted:true];
-    leaf3 = [db putRevision: [leaf3 mutableCopy] prevRevisionID: leaf2.revID allowConflict:true status:&status];
+    leaf3 = [db putRevision: [leaf3 mutableCopy] prevRevisionID: leaf2.revID allowConflict:true
+                     status: &status error: &error];
     AssertEq(status, kCBLStatusOK);
+    AssertNil(error);
 
     AssertEq(true, [leaf3 deleted]);
     AssertEqual(leaf1.docID, leaf3.docID);
@@ -537,6 +569,48 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
     AssertEqual(rows, expectedRows);
 }
 
+- (void) test08a_QueryOpenEnded {
+    RequireTestCase(Index);
+    [self putDocs];
+    CBLView* view = [self createView];
+    AssertEq([view updateIndex], kCBLStatusOK);
+    CBLQueryOptions *options = [CBLQueryOptions new];
+    CBLStatus status;
+    NSArray *rows, *expectedRows;
+
+    // Start, no end:
+    options.startKey = @"g";
+    rows = rowsToDicts([view _queryWithOptions: options status: &status]);
+    expectedRows = $array($dict({@"id",  @"11111"}, {@"key", @"one"}),
+                          $dict({@"id",  @"33333"}, {@"key", @"three"}),
+                          $dict({@"id",  @"22222"}, {@"key", @"two"}));
+    AssertEqual(rows, expectedRows);
+
+    // Start, no end, descending:
+    options->descending = YES;
+    rows = rowsToDicts([view _queryWithOptions: options status: &status]);
+    expectedRows = $array($dict({@"id",  @"44444"}, {@"key", @"four"}),
+                          $dict({@"id",  @"55555"}, {@"key", @"five"}));
+    AssertEqual(rows, expectedRows);
+
+    // End, no start:
+    options = [CBLQueryOptions new];
+    options.endKey = @"g";
+    options->descending = NO;
+    rows = rowsToDicts([view _queryWithOptions: options status: &status]);
+    expectedRows = $array($dict({@"id",  @"55555"}, {@"key", @"five"}),
+                          $dict({@"id",  @"44444"}, {@"key", @"four"}));
+    AssertEqual(rows, expectedRows);
+
+    // End, no start, descending:
+    options->descending = YES;
+    rows = rowsToDicts([view _queryWithOptions: options status: &status]);
+    expectedRows = $array($dict({@"id",  @"22222"}, {@"key", @"two"}),
+                          $dict({@"id",  @"33333"}, {@"key", @"three"}),
+                          $dict({@"id",  @"11111"}, {@"key", @"one"}));
+    AssertEqual(rows, expectedRows);
+}
+
 - (void) test09_QueryStartKeyDocID {
     RequireTestCase(Query);
     [self putDocs];
@@ -585,7 +659,7 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
 
     NSArray* dump = [view.storage dump];
     Log(@"View dump: %@", dump);
-    AssertEqual(dump, $array($dict({@"key", @"\"five\""}, {@"seq", @5}, {@"value", @"-1"}),
+    AssertEqualish(dump, $array($dict({@"key", @"\"five\""}, {@"seq", @5}, {@"value", @"-1"}),
                               $dict({@"key", @"\"five\""}, {@"seq", @5}, {@"value", @"-2"}),
                               $dict({@"key", @"\"four\""}, {@"seq", @2}, {@"value", @"-1"}),
                               $dict({@"key", @"\"four\""}, {@"seq", @2}, {@"value", @"-2"}),
@@ -605,21 +679,61 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
     AssertEqual(rows, expectedRows);
 }
 
-- (void) test11_PrefixMatch {
+static NSArray* reverse(NSArray* a) {
+    return a.reverseObjectEnumerator.allObjects;
+}
+
+- (void) test11a_PrefixMatchStrings {
     RequireTestCase(Query);
     [self putDocs];
     CBLView* view = [self createView];
     AssertEq([view updateIndex], kCBLStatusOK);
 
-    // Query all rows:
+    // Keys with prefix "f":
     CBLQueryOptions *options = [CBLQueryOptions new];
     CBLStatus status;
+    options.startKey = @"f";
     options.endKey = @"f";
     options->prefixMatchLevel = 1;
     NSArray* rows = rowsToDicts([view _queryWithOptions: options status: &status]);
     NSArray* expectedRows = $array($dict({@"id",  @"55555"}, {@"key", @"five"}),
                                    $dict({@"id",  @"44444"}, {@"key", @"four"}));
     AssertEqual(rows, expectedRows);
+
+    // ...descending:
+    options->descending = YES;
+    rows = rowsToDicts([view _queryWithOptions: options status: &status]);
+    AssertEqual(rows, reverse(expectedRows));
+
+    // TODO: Test prefixMatchLevel > 1
+}
+
+- (void) test11b_PrefixMatchArrays {
+    RequireTestCase(Query);
+    [self putDocs];
+    CBLView* view = [db viewNamed: @"view"];
+    [view setMapBlock: MAPBLOCK({
+        int i = [doc[@"_id"] intValue];
+        emit(@[doc[@"key"], @(i)], nil);
+        emit(@[doc[@"key"], @(i/100)], nil);
+    }) reduceBlock: NULL version: @"1"];
+    AssertEq([view updateIndex], kCBLStatusOK);
+
+    // Keys starting with "one":
+    CBLQueryOptions *options = [CBLQueryOptions new];
+    CBLStatus status;
+    options.startKey = options.endKey = @[@"one"];
+    options->prefixMatchLevel = 1;
+    NSArray* rows = rowsToDicts([view _queryWithOptions: options status: &status]);
+    NSArray* expectedRows = $array($dict({@"id",  @"11111"}, {@"key", @[@"one", @111]}),
+                                   $dict({@"id",  @"11111"}, {@"key", @[@"one", @11111]}));
+    AssertEqual(rows, expectedRows);
+
+    // ...descending:
+    options->descending = YES;
+    rows = rowsToDicts([view _queryWithOptions: options status: &status]);
+    AssertEqual(rows, reverse(expectedRows));
+
     // TODO: Test prefixMatchLevel > 1
 }
 
@@ -696,7 +810,6 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
     AssertEqual([rows[0] key], @(33547239));
 }
 
-#if 0 //FIX: REIMPLEMENT GEO
 - (void) test14_GeoQuery {
     RequireTestCase(CBLGeometry);
     RequireTestCase(Index);
@@ -707,9 +820,9 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
     // Bounding-box query:
     CBLQueryOptions *options = [CBLQueryOptions new];
     CBLGeoRect bbox = {{-100, 0}, {180, 90}};
-    options.bbox = &bbox;
+    options->bbox = &bbox;
     CBLStatus status;
-    NSArray* rows = [view _queryWithOptions: options status: &status];
+    NSArray* rows = rowsToDictsSettingDB(db, [view _queryWithOptions: options status: &status]);
     NSArray* expectedRows = @[$dict({@"id", @"xxx"},
                                     {@"geometry", mkGeoRect(-115, -10, -90, 12)},
                                     {@"bbox", @[@-115, @-10, @-90, @12]}),
@@ -719,13 +832,14 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
                                $dict({@"id", @"diy"},
                                      {@"geometry", mkGeoPoint(40.12, 37.53)},
                                      {@"bbox", @[@40.12, @37.53, @40.12, @37.53]})];
-    AssertEqualish(rowsToDicts(rows), expectedRows);
+    AssertEqualish(rows, expectedRows);
 
     // Now try again using the public API:
     CBLQuery* query = [view createQuery];
     query.boundingBox = bbox;
     rows = [[query run: NULL] allObjects];
-    AssertEqualish(rowsToDicts(rows), expectedRows);
+    NSArray* rowDicts = [rows my_map: ^(CBLQueryRow* row) {return row.asJSONDictionary;}];
+    AssertEqualish(rowDicts, expectedRows);
 
     CBLGeoQueryRow* row = rows[0];
     AssertEq(row.boundingBox.min.x, -115);
@@ -741,7 +855,6 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
     AssertEqual(row.geometryType, @"Point");
     AssertEqual(row.geometry, mkGeoPoint(-97.75, 30.25));
 }
-#endif
 
 - (void) test15_AllDocsQuery {
     NSArray* docs = [self putDocs];
@@ -755,12 +868,14 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
     }
 
     // Create a conflict, won by the old revision:
+    NSError* error;
     NSDictionary* props = $dict({@"_id", @"44444"},
                                 {@"_rev", @"1-00"},  // lower revID, will lose conflict
                                 {@"key", @"40ur"});
     CBL_Revision* leaf2 = [[CBL_Revision alloc] initWithProperties: props];
-    CBLStatus status = [db forceInsert: leaf2 revisionHistory: @[] source: nil];
+    CBLStatus status = [db forceInsert: leaf2 revisionHistory: @[] source: nil error: &error];
     Assert(status < 300);
+    AssertNil(error);
 
     AssertEqual([db getDocumentWithID: @"44444" revisionID: nil].revID, [docs[1] revID]);
 
@@ -810,8 +925,10 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
     // Delete a document:
     CBL_Revision* del = docs[0];
     del = [[CBL_Revision alloc] initWithDocID: del.docID revID: del.revID deleted: YES];
-    del = [db putRevision: [del mutableCopy] prevRevisionID: del.revID allowConflict: NO status: &status];
+    del = [db putRevision: [del mutableCopy] prevRevisionID: del.revID allowConflict: NO
+                   status: &status error: &error];
     AssertEq(status, kCBLStatusOK);
+    AssertNil(error);
 
     // Get deleted doc, and one bogus one:
     options = [CBLQueryOptions new];
@@ -825,7 +942,7 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
                                                              {@"deleted", $true})}) ]));
     // Get conflicts:
     options = [CBLQueryOptions new];
-    options->allDocsMode = kCBLIncludeConflicts;
+    options->allDocsMode = kCBLShowConflicts;
     query = [db getAllDocs: options status: &status];
     NSString* curRevID = [docs[1] revID];
     NSDictionary* expectedConflict1 = $dict({@"id",  @"44444"},
@@ -1174,34 +1291,93 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
     CBLFullTextQueryRow* row = rows[0];
     AssertEqual(row.documentID, @"33333");
     AssertEqual(row.fullText, @"a dog whøse ñame was “Dog”");
+    AssertEqual(row.value, @"33333");
     Assert(row.matchCount >= 2u);
     if (row.matchCount >= 2u) {
         Assert(NSEqualRanges([row textRangeOfMatch: 0], NSMakeRange(2, 3)));  // first "dog"
         Assert(NSEqualRanges([row textRangeOfMatch: 1], NSMakeRange(12, 4))); // "ñame"
-        // SQlite's fts4 will report a 3rd match, the second occurrance of "dog",
-        // but our homegrown ForestDB matcher only reports the 1st instance of a term.
-        if (row.matchCount >= 3u)
-            Assert(NSEqualRanges([row textRangeOfMatch: 2], NSMakeRange(22, 3))); // "Dog"
+        Assert(NSEqualRanges([row textRangeOfMatch: 2], NSMakeRange(22, 3))); // "Dog"
     }
 
     // Now delete a document:
     CBL_Revision* rev = docs[3];
     CBL_MutableRevision* del = [[CBL_MutableRevision alloc] initWithDocID: rev.docID revID: rev.revID deleted: YES];
     CBLStatus status;
-    [db putRevision: del prevRevisionID: rev.revID allowConflict: NO status: &status];
+    NSError* error;
+    [db putRevision: del prevRevisionID: rev.revID allowConflict: NO status: &status error: &error];
     AssertEq(status, kCBLStatusOK);
+    AssertNil(error);
 
     AssertEq([view updateIndex], kCBLStatusOK);
 
     // Make sure the deleted doc doesn't still show up in the query results:
     rows = [[query run: NULL] allObjects];
     AssertEq(rows.count, 0u);
+
+    // Make sure an empty FTS query returns an empty result set: (#840)
+    query = [view createQuery];
+    query.fullTextQuery = @"";
+    rows = [[query run: &error] allObjects];
+    AssertEqual(rows, @[]);
+    AssertNil(error);
+
+    // Make sure SQLite rejects invalid FTS query strings with an error: (#840)
+    if (self.isSQLiteDB) {
+        query = [view createQuery];
+        query.fullTextQuery = @"\"";
+        error = nil;
+        CBLQueryEnumerator* e = [query run: &error];
+        AssertNil(e);
+        AssertEq(error.code, 400);
+    }
 }
 
-#if 0 // Boolean operators and snippets are not available (yet) with ForestDB
-- (void) test24_FullTextQuery_Advanced {
+
+- (void) test24_FullTextRanking {
+    RequireTestCase(Query);
+
+    // Text by Cicero's "de Finibus Bonorum et Malorum", copied from http://www.lipsum.com/
+    NSMutableArray* docs = $marray();
+    [docs addObject: [self putDoc: $dict({@"_id", @"11111"}, {@"text", @"But I must explain to you how all this mistaken idea of denouncing pleasure and praising pain was born and I will give you a complete account of the system, and expound the actual teachings of the great explorer of the truth, the master-builder of human happiness."})]];
+    [docs addObject: [self putDoc: $dict({@"_id", @"22222"}, {@"text", @"No one rejects, dislikes, or avoids pleasure itself, because it is pleasure, but because those who do not know how to pursue pleasure rationally encounter consequences that are extremely painful."})]];
+    [docs addObject: [self putDoc: $dict({@"_id", @"33333"}, {@"text", @"Nor again is there anyone who loves or pursues or desires to obtain pain of itself, because it is pain, but because occasionally circumstances occur in which toil and pain can procure him some great pleasure."})]];
+    [docs addObject: [self putDoc: $dict({@"_id", @"44444"}, {@"text", @"To take a trivial example, which of us ever undertakes laborious physical exercise, except to obtain some advantage from it? "})]];
+    [docs addObject: [self putDoc: $dict({@"_id", @"55555"}, {@"text", @"But who has any right to find fault with a man who chooses to enjoy a pleasure that has no annoying consequences, or one who avoids a pain that produces no resultant pleasure?"})]];
+
+    CBLView* view = [db viewNamed: @"fts"];
+    [view setMapBlock: MAPBLOCK({
+        if (doc[@"text"])
+            emit(CBLTextKey(doc[@"text"]), doc[@"_id"]);
+    }) reduceBlock: NULL version: @"1"];
+
+    AssertEq([view updateIndex], kCBLStatusOK);
+
+    // Query the full-text index:
+    CBLQuery *query = [view createQuery];
+    query.fullTextQuery = @"pleasure pain";
+    query.fullTextRanking = YES;
+    query.fullTextSnippets = YES;
+    NSArray* rows = [[query run: NULL] allObjects];
+    AssertEq(rows.count, 4u);
+
+    NSArray* matchDocIDs = @[@"33333", @"22222", @"55555", @"11111"];
+    for (NSUInteger i = 0; i < 3; i++) {
+        CBLFullTextQueryRow* row = rows[i];
+        AssertEqual(row.documentID, matchDocIDs[i]);
+        NSString* snippet = [row snippetWithWordStart: @"[" wordEnd: @"]"];
+        Log(@"Snippet #%lu = '%@'", (unsigned long)i, snippet);
+        // SQLite and ForestDB storage don't create exactly the same snippets,
+        // so just check that the snippet makes some minimal sense:
+        Assert([snippet containsString: @"[pleasure]"] || [snippet containsString: @"[pain"]);
+    }
+}
+
+
+- (void) test25_FullTextQuery_Advanced {
+    if (!self.isSQLiteDB)
+        return; // Boolean operators and snippets are not available (yet) with ForestDB
+
     RequireTestCase(CBL_View_FullTextQuery);
-    CBLDatabase *db = createDB();
     CBLStatus status;
 
     NSMutableArray* docs = $marray();
@@ -1212,10 +1388,9 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
     [docs addObject: [self putDoc: $dict({@"_id", @"55555"}, {@"text", @"was barking."})]];
 
     CBLView* view = [db viewNamed: @"fts"];
-    view.indexType = kCBLFullTextIndex;
     [view setMapBlock: MAPBLOCK({
         if (doc[@"text"])
-            emit(doc[@"text"], doc[@"_id"]);
+            emit(CBLTextKey(doc[@"text"]), doc[@"_id"]);
     }) reduceBlock: NULL version: @"1"];
 
     AssertEq([view updateIndex], kCBLStatusOK);
@@ -1228,21 +1403,21 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
     Assert(rowIter, @"_queryFullText failed: %d", status);
     Log(@"rows = %@", rowIter);
     NSArray* expectedRows = $array($dict({@"id",  @"44444"},
-                                         {@"matches", @[@{@"range": @[@4, @7], @"term": @0}]},
+                                         {@"matches", @[@{@"range": @[@4, @6], @"term": @0}]},
                                          {@"snippet", @"and [STöRMy] night."},
                                          {@"value", @"44444"}),
                                    $dict({@"id",  @"33333"},
                                          {@"matches", @[@{@"range": @[@2,  @3], @"term": @1},
-                                                        @{@"range": @[@26, @3], @"term": @1}]},
+                                                        @{@"range": @[@22, @3], @"term": @1}]},
                                          {@"snippet", @"a [dog] whøse ñame was “[Dog]”"},
                                          {@"value", @"33333"}));
-    AssertEqual(rowsToDicts(rowIter), expectedRows);
+    AssertEqualish(rowsToDicts(rowIter), expectedRows);
 
     // Try a query with snippets:
     CBLQuery* query = [view createQuery];
     query.fullTextQuery = @"(was NOT barking) OR dog";
     query.fullTextSnippets = YES;
-    rows = [[query run: NULL] allObjects];
+    NSArray* rows = [[query run: NULL] allObjects];
     AssertEq(rows.count, 2u);
 
     CBLFullTextQueryRow* row = rows[0];
@@ -1274,7 +1449,8 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
     // Now delete a document:
     CBL_Revision* rev = docs[3];
     CBL_MutableRevision* del = [[CBL_MutableRevision alloc] initWithDocID: rev.docID revID: rev.revID deleted: YES];
-    [db putRevision: del prevRevisionID: rev.revID allowConflict: NO status: &status];
+    NSError* error;
+    Assert([db putRevision: del prevRevisionID: rev.revID allowConflict: NO status: &status error: &error] != nil);
     AssertEq(status, kCBLStatusOK);
 
     AssertEq([view updateIndex], kCBLStatusOK);
@@ -1286,35 +1462,38 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
     Log(@"after deletion, rows = %@", rowIter);
 
     expectedRows = $array($dict({@"id",  @"44444"},
-                                {@"matches", @[@{@"range": @[@4, @7], @"term": @0}]},
+                                {@"matches", @[@{@"range": @[@4, @6], @"term": @0}]},
                                 {@"snippet", @"and [STöRMy] night."},
                                 {@"value", @"44444"}));
-    AssertEqual(rowsToDicts(rowIter), expectedRows);
+    AssertEqualish(rowsToDicts(rowIter), expectedRows);
 }
-#endif
 
 
-- (void) test25_TotalDocs {
+- (void) test26_TotalDocs {
     // Create some docs
     NSArray* docs = [self putDocs];
     NSUInteger totalRows = [docs count];
     
     // Create a view
     CBLView* view = [self createView];
-    AssertEq(view.totalRows, 0u);
+    AssertEq(view.currentTotalRows, 0u);
     AssertEq([view updateIndex], kCBLStatusOK);
+    Assert(!view.stale);
+    AssertEq(view.currentTotalRows, totalRows);
     AssertEq(view.totalRows, totalRows);
 
     // Create a conflict, won by the new revision:
     NSDictionary* props;
     CBLStatus status;
+    NSError* error;
     CBL_Revision* rev;
     props = $dict({@"_id", @"44444"},
                   {@"_rev", @"1-ffffff"},  // higher revID, will win conflict
                   {@"key", @"40ur"});
     rev = [[CBL_Revision alloc] initWithProperties: props];
-    status = [db forceInsert: rev revisionHistory: @[] source: nil];
+    status = [db forceInsert: rev revisionHistory: @[] source: nil error: &error];
     Assert(status < 300);
+    AssertNil(error);
     AssertEq([view updateIndex], kCBLStatusOK);
     AssertEq(view.totalRows, totalRows);
     
@@ -1323,8 +1502,9 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
                   {@"_rev", @"1-000000"},  // lower revID, will lose conflict
                   {@"key", @"40ur"});
     rev = [[CBL_Revision alloc] initWithProperties: props];
-    status = [db forceInsert: rev revisionHistory: @[] source: nil];
+    status = [db forceInsert: rev revisionHistory: @[] source: nil error: &error];
     Assert(status < 300);
+    AssertNil(error);
     AssertEq([view updateIndex], kCBLStatusOK);
     AssertEq(view.totalRows, totalRows);
     
@@ -1332,8 +1512,10 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
     CBL_MutableRevision* nuRev = [[CBL_MutableRevision alloc] initWithDocID: rev.docID
                                                                       revID: nil deleted:NO];
     nuRev.properties = $dict({@"key", @"F0uR"});
-    rev = [db putRevision: nuRev prevRevisionID: rev.revID allowConflict: NO status: &status];
+    rev = [db putRevision: nuRev prevRevisionID: rev.revID allowConflict: NO
+                   status: &status error: &error];
     Assert(status < 300);
+    AssertNil(error);
     AssertEq([view updateIndex], kCBLStatusOK);
     AssertEq(view.totalRows, totalRows);
     
@@ -1341,14 +1523,16 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
     Log(@"Deleting doc 33333...");
     CBL_Revision* doc3 = docs[3];
     CBL_MutableRevision* del = [[CBL_MutableRevision alloc] initWithDocID: doc3.docID revID: nil deleted: YES];
-    [db putRevision: del prevRevisionID: doc3.revID allowConflict: NO status: &status];
+    [db putRevision: del prevRevisionID: doc3.revID allowConflict: NO status: &status error: &error];
     AssertEq(status, kCBLStatusOK);
+    AssertNil(error);
     AssertEq([view updateIndex], kCBLStatusOK);
     AssertEq(view.totalRows, totalRows - 1);
     
     // Delete the index
     [view deleteIndex];
-    AssertEq(view.totalRows, 0u);
+    Assert(view.stale);
+    AssertEq(view.currentTotalRows, 0u);
 }
 
 

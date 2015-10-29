@@ -3,12 +3,20 @@
 //  CouchbaseLite
 //
 //  Created by Jens Alfke on 1/12/15.
+//  Copyright (c) 2011-2015 Couchbase, Inc. All rights reserved.
 //
-//
+//  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file
+//  except in compliance with the License. You may obtain a copy of the License at
+//    http://www.apache.org/licenses/LICENSE-2.0
+//  Unless required by applicable law or agreed to in writing, software distributed under the
+//  License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+//  either express or implied. See the License for the specific language governing permissions
+//  and limitations under the License.
 
 #import "CBL_Router.h"
 #import "CBLDatabase.h"
 #import "CouchbaseLitePrivate.h"
+#import "CBLInternal.h"
 #import "CBLMisc.h"
 
 
@@ -35,10 +43,18 @@ NSTimeInterval kMinHeartbeat = 5.0;
     CBLChangesOptions options = kDefaultCBLChangesOptions;
     _changesIncludeDocs = [self boolQuery: @"include_docs"];
     _changesIncludeConflicts = $equal([self query: @"style"], @"all_docs");
+    if (_changesIncludeDocs)
+        _changesContentOptions = self.contentOptions;
     options.includeDocs = _changesIncludeDocs;
     options.includeConflicts = _changesIncludeConflicts;
-    options.contentOptions = [self contentOptions];
     options.sortBySequence = !options.includeConflicts;
+
+    BOOL descending = [self boolQuery: @"descending"] && options.sortBySequence;
+    // valid option only when the mode is NormalFeed:
+    if (descending && _changesMode != kNormalFeed)
+        return kCBLStatusBadParam;
+    options.descending = descending;
+
     options.limit = [self intQuery: @"limit" defaultValue: options.limit];
     int since = [[self query: @"since"] intValue];
     
@@ -140,6 +156,15 @@ NSTimeInterval kMinHeartbeat = 5.0;
 
 
 - (NSDictionary*) changeDictForRev: (CBL_Revision*)rev {
+    if (_changesIncludeDocs) {
+        CBLStatus status;
+        CBL_Revision* rev2 = [self applyOptions: _changesContentOptions
+                                     toRevision: rev status: &status];
+        if (rev2) {
+            rev2.sequence = rev.sequence;
+            rev = rev2;
+        }
+    }
     return $dict({@"seq", @(rev.sequence)},
                  {@"id",  rev.docID},
                  {@"changes", $marray($dict({@"rev", rev.revID}))},
@@ -155,19 +180,21 @@ NSTimeInterval kMinHeartbeat = 5.0;
     NSMutableArray* changes = $marray();
     for (CBLDatabaseChange* change in (n.userInfo)[@"changes"]) {
         CBL_Revision* rev = change.addedRevision;
-        CBL_Revision* winningRev = change.winningRevision;
+        NSString* winningRevID = change.winningRevisionID;
 
         if (!_changesIncludeConflicts) {
-            if (!winningRev)
+            if (!winningRevID)
                 continue;     // this change doesn't affect the winning rev ID, no need to send it
-            else if (!$equal(winningRev, rev)) {
+            else if (!$equal(winningRevID, rev.revID)) {
                 // This rev made a _different_ rev current, so substitute that one.
                 // We need to emit the current sequence # in the feed, so put it in the rev.
                 // This isn't correct internally (this is an old rev so it has an older sequence)
                 // but consumers of the _changes feed don't care about the internal state.
-                CBL_MutableRevision* mRev = winningRev.mutableCopy;
-                if (_changesIncludeDocs)
-                    [_db loadRevisionBody: mRev options: 0];
+                CBLStatus status;
+                CBL_Revision* mRev = [_db getDocumentWithID: rev.docID
+                                                 revisionID: winningRevID
+                                                   withBody: _changesIncludeDocs
+                                                     status: &status];
                 mRev.sequence = rev.sequence;
                 rev = mRev;
             }

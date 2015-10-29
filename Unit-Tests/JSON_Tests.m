@@ -29,6 +29,10 @@
     XCTAssertEqualWithAccuracy([CBLJSON absoluteTimeWithJSONObject: @"2013-04-01T20:42:33Z"], 386541753.000, 1e-6);
     NSDate* date = [CBLJSON dateWithJSONObject: @"2013-04-01T20:42:33Z"];
     AssertEq(date.timeIntervalSinceReferenceDate, 386541753.000);
+    date = [CBLJSON dateWithJSONObject: @"2013-04-01T20:42:33+0000"];
+    AssertEq(date.timeIntervalSinceReferenceDate, 386541753.000);
+    date = [CBLJSON dateWithJSONObject: @"2013-04-01T20:42:33+00:00"];
+    AssertEq(date.timeIntervalSinceReferenceDate, 386541753.000);
     date = [CBLJSON dateWithJSONObject: @"2013-04-01T20:42:33.388Z"];
     XCTAssertEqualWithAccuracy(date.timeIntervalSinceReferenceDate, 386541753.388, 1e-6);
     AssertNil([CBLJSON dateWithJSONObject: @""]);
@@ -141,6 +145,55 @@ static NSString* canonicalString(id obj) {
     NSData* json = [CBJSONEncoder canonicalEncoding: [NSDecimalNumber notANumber] error: &error];
     Assert(!json);
     AssertEqual(error.domain, CBJSONEncoderErrorDomain);
+}
+
+- (void) test_CBJSONEncoder_Filter {
+    NSDictionary* input = @{@"foo": @1, @"bar": @2};
+    CBJSONEncoder* encoder = [[CBJSONEncoder alloc] init];
+    encoder.canonical = YES;
+    encoder.keyFilter = ^BOOL(NSString* key, NSError** outError) {
+        return ![key isEqualToString: @"bar"];
+    };
+    Assert([encoder encode: input]);
+    AssertEqual([encoder.output my_UTF8ToString], @"{\"foo\":1}");
+
+    encoder = [[CBJSONEncoder alloc] init];
+    encoder.canonical = YES;
+    encoder.keyFilter = ^BOOL(NSString* key, NSError** outError) {
+        if ([key isEqualToString: @"bar"]) {
+            *outError = [NSError errorWithDomain: @"Bar" code: 847 userInfo: nil];
+            return NO;
+        }
+        return YES;
+    };
+    Assert(![encoder encode: input]);
+    AssertEqual(encoder.error.domain, @"Bar");
+    AssertEq(encoder.error.code, 847);
+}
+
+
+- (void) test_CBJSONEncoderBenchmark {
+    id obj = [CBLJSON JSONObjectWithData: [self contentsOfTestFile: @"beer.json"] options: 0 error: NULL];
+    [self measureBlock:^{
+        for (int i = 0; i < 10000; i++) {
+            @autoreleasepool {
+                NSError* error;
+                Assert([CBJSONEncoder encode: obj error: &error]);
+            }
+        }
+    }];
+}
+
+- (void) test_NSJSONEncoderBenchmark {
+    id obj = [CBLJSON JSONObjectWithData: [self contentsOfTestFile: @"beer.json"] options: 0 error: NULL];
+    [self measureBlock:^{
+        for (int i = 0; i < 10000; i++) {
+            @autoreleasepool {
+                NSError* error;
+                Assert([CBLJSON dataWithJSONObject: obj options: 0 error: &error]);
+            }
+        }
+    }];
 }
 
 

@@ -23,7 +23,7 @@ typedef enum {
 } CBLViewCollation;
 
 
-BOOL CBLRowPassesFilter(CBLDatabase* db, CBLQueryRow* row, const CBLQueryOptions* options);
+BOOL CBLQueryRowValueIsEntireDoc(id value);
 
 
 @interface CBLView () <CBL_ViewStorageDelegate>
@@ -39,7 +39,8 @@ BOOL CBLRowPassesFilter(CBLDatabase* db, CBLQueryRow* row, const CBLQueryOptions
 
 - (void) close;
 
-@property (readonly) NSUInteger totalRows;
+/** Current total rows in the view. The index will not be updated when accessing this property. */
+@property (readonly) NSUInteger currentTotalRows;
 
 /** The map block alredy registered with the view. Unlike the public .mapBlock property, this
     will not look for a design document or compile a function therein. */
@@ -96,9 +97,13 @@ BOOL CBLRowPassesFilter(CBLDatabase* db, CBLQueryRow* row, const CBLQueryOptions
                              view: (CBLView*)view
                    sequenceNumber: (SequenceNumber)sequenceNumber
                              rows: (NSArray*)rows;
+- (void) sortUsingDescriptors: (NSArray*)sortDescriptors
+                         skip: (NSUInteger)skip
+                        limit: (NSUInteger)limit;
 @end
 
 
 @interface CBLQueryRow ()
+- (void) moveToDatabase: (CBLDatabase*)database view: (CBLView*)view;
 - (void) _clearDatabase;
 @end

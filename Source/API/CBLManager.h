@@ -6,16 +6,10 @@
 //  Copyright (c) 2012-2013 Couchbase, Inc. All rights reserved.
 //
 
-#import <Foundation/Foundation.h>
+#import "CBLBase.h"
 @class CBLDatabase;
 
-#if __has_feature(nullability) // Xcode 6.3+
-#pragma clang assume_nonnull begin
-#else
-#define nullable
-#define __nullable
-#endif
-
+NS_ASSUME_NONNULL_BEGIN
 /** Option flags for CBLManager initialization. */
 typedef struct CBLManagerOptions {
     bool                 readOnly;          /**< No modifications to databases are allowed. */
@@ -46,15 +40,22 @@ typedef struct CBLManagerOptions {
     @param directory  Path to data directory. If it doesn't already exist it will be created.
     @param options  If non-NULL, a pointer to options (read-only and no-replicator).
     @param outError  On return, the error if any. */
-- (instancetype) initWithDirectory: (NSString*)directory
-                           options: (__nullable const CBLManagerOptions*)options
-                             error: (__nullable NSError**)outError;
+- (nullable instancetype) initWithDirectory: (NSString*)directory
+                                    options: (const CBLManagerOptions* __nullable)options
+                                      error: (NSError**)outError;
 
 /** Creates a copy of this CBLManager, which can be used on a different thread. */
 - (instancetype) copy;
 
 /** Releases all resources used by the CBLManager instance and closes all its databases. */
 - (void) close;
+
+/** Storage engine type. There are two options, "SQLite" (default) or "ForestDB". */
+@property (copy, nonatomic) NSString* storageType;
+
+/** Should existing databases be upgraded to the preferred storage engine type when opened?
+    (Defaults to NO.) */
+@property (nonatomic) BOOL upgradeStorage;
 
 /** The root directory of this manager (as specified at initialization time.) */
 @property (readonly) NSString* directory;
@@ -69,28 +70,84 @@ typedef struct CBLManagerOptions {
     Multiple calls with the same name will return the same CBLDatabase instance.
     NOTE: Database names may not contain capital letters! */
 - (nullable CBLDatabase*) databaseNamed: (NSString*)name
-                                  error: (__nullable NSError**)outError;
+                                  error: (NSError**)outError;
 
 /** Returns the database with the given name, or nil if it doesn't exist.
     Multiple calls with the same name will return the same CBLDatabase instance. */
 - (nullable CBLDatabase*) existingDatabaseNamed: (NSString*)name
-                                          error: (__nullable NSError**)outError;
+                                          error: (NSError**)outError;
+
+/** Returns YES if a database with the given name exists. Does not open the database. */
+- (BOOL) databaseExistsNamed: (NSString*)name;
+
+/** Registers an encryption key for a database. This must be called _before_ opening an encrypted
+    database, or before creating a database that's to be encrypted.
+    If the key is incorrect (or no key is given for an encrypted database), the subsequent call
+    to open the database will fail with an error with code 401.
+    To use this API, the database storage engine must support encryption. In the case of SQLite,
+    this means the application must be linked with SQLCipher <http://sqlcipher.net> instead of
+    regular SQLite. Otherwise opening the database will fail with an error.
+    @param keyOrPassword  The encryption key in the form of an NSString (a password) or an
+                NSData object exactly 32 bytes in length (a raw AES key.) If a string is given,
+                it will be internally converted to a raw key using 64,000 rounds of PBKDF2 hashing.
+                A nil value is legal, and clears a previously-registered key.
+    @param name  The name of the database this key applies to.
+    @result  YES if the key can be used, NO if it's not in a legal form (e.g. NSData object not 32
+                bytes in length.) */
+- (BOOL) registerEncryptionKey: (nullable id)keyOrPassword
+              forDatabaseNamed: (NSString*)name;
+
+#if !TARGET_OS_IPHONE
+/** Encrypts a database using a randomly-generated key that's stored in the default Keychain.
+    This must be called before opening an encrypted database, or before creating a database
+    that's to be encrypted.
+ 
+    (The effect is similar to -registerEncryptionKey:forDatabaseNamed:, except that storage of
+    the key is taken care of automatically.)
+
+    For security reasons this method is not available on iOS. Instead, consider using
+    CBLEncryptionController (found in the Extras folder of the distribution) as a high level
+    interface for managing database encryption using a user-supplied password or TouchID. */
+- (BOOL) encryptDatabaseNamed: (NSString*)name;
+#endif
 
 /** Same as -existingDatabaseNamed:. Enables "[]" access in Xcode 4.4+ */
 - (nullable CBLDatabase*) objectForKeyedSubscript: (NSString*)key;
 
 /** An array of the names of all existing databases. */
-@property (readonly) NSArray* allDatabaseNames;
+@property (readonly) CBLArrayOf(NSString*)* allDatabaseNames;
 
-/** Replaces or installs a database from a file.
-    This is primarily used to install a canned database on first launch of an app, in which case you should first check .exists to avoid replacing the database if it exists already. The canned database would have been copied into your app bundle at build time.
+
+#ifdef CBL_DEPRECATED
+/** Replaces or installs a database from a file. This is primarily used to install a canned database 
+    on first launch of an app, in which case you should first check .exists to avoid replacing the 
+    database if it exists already. The canned database would have been copied into your app bundle 
+    at build time. This property is deprecated for the new .cblite2 database file. If the database 
+    file is a directory and has the .cblite2 extension, 
+    use -replaceDatabaseNamed:withDatabaseDir:error: instead.
+ @param databaseName  The name of the database to replace.
+ @param databasePath  Path of the database file that should replace it.
+ @param attachmentsPath  Path of the associated attachments directory, or nil if there are no attachments.
+ @param outError  If an error occurs, it will be stored into this parameter on return.
+ @return  YES if the database was copied, NO if an error occurred. */
+- (BOOL) replaceDatabaseNamed: (NSString*)databaseName
+             withDatabaseFile: (NSString*)databasePath
+              withAttachments: (NSString*)attachmentsPath
+                        error: (NSError**)outError                  __attribute__((nonnull(1,2)));
+#endif
+
+/** Replaces or installs a database from a file. This is primarily used to install a canned database 
+    on first launch of an app, in which case you should first check .exists to avoid replacing the 
+    database if it exists already. The canned database would have been copied into your app bundle 
+    at build time. If the database file is not a directory and has the .cblite extension,
+    use -replaceDatabaseNamed:withDatabaseFile:withAttachments:error: instead.
     @param databaseName  The name of the database to replace.
     @param databaseDir  Path of the database directory that should replace it.
     @param outError  If an error occurs, it will be stored into this parameter on return.
     @return  YES if the database was copied, NO if an error occurred. */
 - (BOOL) replaceDatabaseNamed: (NSString*)databaseName
               withDatabaseDir: (NSString*)databaseDir
-                        error: (__nullable NSError**)outError;
+                        error: (NSError**)outError;
 
 #pragma mark - CONCURRENCY:
 
@@ -126,7 +183,7 @@ typedef struct CBLManagerOptions {
     It's usually more convenient to enable logging via command-line args, as discussed on that
     same page; but in some environments you may not have access to the args, or may want to use
     other criteria to enable logging. */
-+ (void) enableLogging: (NSString*)type;
++ (void) enableLogging: (nullable NSString*)type;
 
 /** Redirects Couchbase Lite logging: instead of writing to the console/stderr, it will call the
     given block. Passing a nil block restores the default behavior. */
@@ -147,6 +204,4 @@ extern NSString* const CBLHTTPErrorDomain;
 
 
 
-#if __has_feature(nullability)
-#pragma clang assume_nonnull end
-#endif
+NS_ASSUME_NONNULL_END

@@ -9,11 +9,8 @@
 #import <Foundation/Foundation.h>
 #import "CBLDatabase.h"
 #import "CBL_Body.h"
+#import "CBLMisc.h"
 @class CBL_MutableRevision;
-
-
-/** Database sequence ID */
-typedef SInt64 SequenceNumber;
 
 
 /** Stores information about a revision -- its docID, revID, and whether it's deleted. It can also store the sequence number and document contents (they can be added after creation). */
@@ -39,6 +36,8 @@ typedef SInt64 SequenceNumber;
 /** Adds "_id", "_rev", "_deleted" properties */
 - (CBL_Revision*) revisionByAddingBasicMetadata;
 
+- (CBL_Revision*) copyWithoutBody;
+
 /** Returns the JSON to be stored into the database.
     This has all the special keys like "_id" stripped out, and keys in canonical order. */
 @property (readonly) NSData* asCanonicalJSON;
@@ -63,6 +62,8 @@ typedef SInt64 SequenceNumber;
 
 - (NSComparisonResult) compareSequences: (CBL_Revision*)rev;
 
+- (NSComparisonResult) compareSequencesDescending: (CBL_Revision*)rev;
+
 /** Generation number: 1 for a new document, 2 for the 2nd revision, ...
     Extracted from the numeric prefix of the revID. */
 @property (readonly) unsigned generation;
@@ -83,8 +84,11 @@ typedef SInt64 SequenceNumber;
 
 @property (readwrite, strong) CBL_Body* body;
 @property (readwrite, copy) NSDictionary* properties;
-@property (readwrite, copy) NSData* asJSON;
 @property (readwrite) bool missing;
+
+/** Overridden to make this settable. When set, the "_id", "_rev" and "_deleted" properties will be
+    added to the JSON data; it MUST NOT already include them! */
+@property (readwrite, copy) NSData* asJSON;
 
 - (void) setDocID:(NSString *)docID
             revID: (NSString*)revID;
@@ -101,7 +105,7 @@ typedef SInt64 SequenceNumber;
 
 
 /** An ordered list of CBLRevs. */
-@interface CBL_RevisionList : NSObject <NSFastEnumeration>
+@interface CBL_RevisionList : NSObject <NSFastEnumeration, NSMutableCopying>
 
 - (instancetype) init;
 - (instancetype) initWithArray: (NSArray*)revs;
@@ -121,11 +125,12 @@ typedef SInt64 SequenceNumber;
 
 - (void) addRev: (CBL_Revision*)rev;
 - (void) removeRev: (CBL_Revision*)rev;
+- (void) removeRevIdenticalTo: (CBL_Revision*)rev;
 - (CBL_Revision*) removeAndReturnRev: (CBL_Revision*)rev;  // returns the object removed, or nil
 - (void) removeObjectAtIndex: (NSUInteger)index;
 
 - (void) limit: (NSUInteger)limit;
-- (void) sortBySequence;
+- (void) sortBySequenceAscending:(BOOL)ascending;
 - (void) sortByDocID;
 
 @end

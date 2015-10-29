@@ -183,6 +183,20 @@ NSString* const kCBLViewChangeNotification = @"CBLViewChange";
 }
 
 
+- (NSString*) documentType {
+    CBLDatabase* db = _weakDB;
+    return [db.shared valueForType: @"docType" name: _name inDatabaseNamed: db.name];
+}
+
+- (void) setDocumentType: (NSString*)type {
+    CBLDatabase* db = _weakDB;
+    [db.shared setValue: type forType: @"docType" name: _name inDatabaseNamed: db.name];
+}
+
+
+#pragma mark - COMPILATION:
+
+
 static id<CBLViewCompiler> sCompiler;
 
 
@@ -239,9 +253,10 @@ static id<CBLViewCompiler> sCompiler;
     NSString* version = CBLHexSHA1Digest([CBJSONEncoder canonicalEncoding: viewProps error: &error]);
     [self setMapBlock: mapBlock reduceBlock: reduceBlock version: version];
 
+    self.documentType = $castIf(NSString, viewProps[@"documentType"]);
     NSDictionary* options = $castIf(NSDictionary, viewProps[@"options"]);
     _collation = ($equal(options[@"collation"], @"raw")) ? kCBLViewCollationRaw
-    : kCBLViewCollationUnicode;
+                                                         : kCBLViewCollationUnicode;
     return kCBLStatusOK;
 }
 
@@ -308,8 +323,14 @@ static id<CBLViewCompiler> sCompiler;
 #pragma mark - QUERYING:
 
 
-- (NSUInteger) totalRows {
+- (NSUInteger) currentTotalRows {
     return _storage.totalRows;
+}
+
+
+- (NSUInteger) totalRows {
+    [self updateIndex];
+    return [self currentTotalRows];
 }
 
 
@@ -346,7 +367,10 @@ static id<CBLViewCompiler> sCompiler;
         iterator = [_storage reducedQueryWithOptions: options status: outStatus];
     else
         iterator = [_storage regularQueryWithOptions: options status: outStatus];
-    LogTo(Query, @"Query %@: Returning iterator", _name);
+    if (iterator)
+        LogTo(Query, @"Query %@: Returning iterator", _name);
+    else
+        LogTo(Query, @"Query %@: Failed with status %d", _name, *outStatus);
     return iterator;
 }
 

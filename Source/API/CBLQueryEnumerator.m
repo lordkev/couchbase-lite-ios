@@ -3,11 +3,18 @@
 //  CouchbaseLite
 //
 //  Created by Jens Alfke on 2/11/15.
+//  Copyright (c) 2012-2015 Couchbase, Inc. All rights reserved.
 //
-//
+//  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file
+//  except in compliance with the License. You may obtain a copy of the License at
+//    http://www.apache.org/licenses/LICENSE-2.0
+//  Unless required by applicable law or agreed to in writing, software distributed under the
+//  License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+//  either express or implied. See the License for the specific language governing permissions
+//  and limitations under the License.
 
 #import "CBLQuery.h"
-#import "CouchbaseLitePrivate.h"
+#import "CBLInternal.h"
 #import "CBLView+Internal.h"
 #import "CBL_StorageTypes.h"
 
@@ -119,6 +126,20 @@
     _rows = [self.allObjects sortedArrayUsingDescriptors: sortDescriptors];
 }
 
+- (void) sortUsingDescriptors: (NSArray*)sortDescriptors
+                         skip: (NSUInteger)skip
+                        limit: (NSUInteger)limit
+{
+    [self sortUsingDescriptors: sortDescriptors];
+    NSUInteger n = _rows.count;
+    if (skip >= n) {
+        _rows = @[];
+    } else if (skip > 0 || limit < n) {
+        limit = MIN(limit, n - skip);
+        _rows = [_rows subarrayWithRange: NSMakeRange(skip, limit)];
+    }
+}
+
 
 - (CBLQueryRow*) nextRow {
     if (_rows) {
@@ -168,7 +189,8 @@
 
 
 - (void) reset {
-    Assert(!_usingIterator, @"Enumerator is not at start");
+    Assert(!_usingIterator, @"Sorry, the enumerator did not save up its rows so it cannot be "
+           "reset. Call -allObjects first thing to make the enumerator resettable.");
     _nextRow = 0;
 }
 

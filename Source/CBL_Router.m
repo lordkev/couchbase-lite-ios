@@ -36,11 +36,6 @@
 #endif
 
 
-@interface CBL_Router (Handlers)
-- (CBLStatus) do_GETRoot;
-@end
-
-
 @implementation CBL_Router
 
 
@@ -58,6 +53,7 @@
             _changesMode = kNormalFeed;
             _changesFilter = NULL;
             _changesFilterParams = nil;
+            _changesContentOptions = 0;
         }
     }
     return self;
@@ -84,7 +80,7 @@
 
 
 @synthesize onAccessCheck=_onAccessCheck, onResponseReady=_onResponseReady,
-            onDataAvailable=_onDataAvailable, onFinished=_onFinished,
+            onDataAvailable=_onDataAvailable, onFinished=_onFinished, source=_source,
             request=_request, response=_response, processRanges=_processRanges;
 
 
@@ -202,7 +198,6 @@
     options->reduceSpecified = [self query: @"reduce"] != nil;
     options->reduce =  [self boolQuery: @"reduce"];
     options->group = [self boolQuery: @"group"];
-    options->content = [self contentOptions];
 
     // Stale options (ok or update_after):
     NSString *stale = [self query: @"stale"];
@@ -211,6 +206,8 @@
             options->indexUpdateMode = kCBLUpdateIndexNever;
         else if ([stale isEqualToString:@"update_after"])
             options->indexUpdateMode = kCBLUpdateIndexAfter;
+        else if ([stale isEqualToString:@"false"])    // 'false' is a no-op, for CBS compatibility
+            options->indexUpdateMode = kCBLUpdateIndexBefore;
         else
             return nil;
     }
@@ -556,12 +553,13 @@ static NSArray* splitPath( NSURL* url ) {
     NSUInteger from, to;
     if (fromStr.length > 0) {
         from = (NSUInteger)fromStr.integerValue;
-        if (toStr.length > 0)
-            to = MIN((NSUInteger)toStr.integerValue, bodyLength - 1);
-        else
+        if (toStr.length > 0) {
+            to = (NSUInteger)toStr.integerValue;
+            if (to < from)
+                return;  // invalid range
+            to = MIN(to, bodyLength - 1);
+        } else
             to = bodyLength - 1;
-        if (to < from)
-            return;  // invalid range
     } else if (toStr.length > 0) {
         to = bodyLength - 1;
         from = bodyLength - MIN((NSUInteger)toStr.integerValue, bodyLength);
@@ -569,7 +567,7 @@ static NSArray* splitPath( NSURL* url ) {
         return;  // "-" is an invalid range
     }
 
-    if (from >= bodyLength || to < from) {
+    if (from >= bodyLength) {
         _response.status = 416; // Requested Range Not Satisfiable
         NSString* contentRangeStr = $sprintf(@"bytes */%llu", (uint64_t)bodyLength);
         _response[@"Content-Range"] = contentRangeStr;

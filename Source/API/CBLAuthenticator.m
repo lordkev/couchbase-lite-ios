@@ -3,6 +3,7 @@
 //  CouchbaseLite
 //
 //  Created by Jens Alfke on 4/11/14.
+//  Copyright (c) 2014-2015 Couchbase, Inc. All rights reserved.
 //
 //  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file
 //  except in compliance with the License. You may obtain a copy of the License at
@@ -17,6 +18,8 @@
 #import "CBLAuthorizer.h"
 #import "CBLTokenAuthorizer.h"
 #import "CBLOAuth1Authorizer.h"
+#import "CBLClientCertAuthorizer.h"
+#import "MYAnonymousIdentity.h"
 
 
 @implementation CBLAuthenticator
@@ -25,10 +28,7 @@
 + (id<CBLAuthenticator>) basicAuthenticatorWithName: (NSString*)name
                                            password: (NSString*)password
 {
-    NSURLCredential *cred = [NSURLCredential credentialWithUser: name
-                                                       password: password
-                                                    persistence: NSURLCredentialPersistenceNone];
-    return [[CBLBasicAuthorizer alloc] initWithCredential: cred];
+    return [[CBLPasswordAuthorizer alloc] initWithUser: name password: password];
 }
 
 + (id<CBLAuthenticator>) facebookAuthenticatorWithToken: (NSString*)token {
@@ -52,6 +52,22 @@
                                                       token: token
                                                 tokenSecret: tokenSecret
                                             signatureMethod: signatureMethod];
+}
+
++ (id<CBLAuthenticator>) SSLClientCertAuthenticatorWithIdentity: (SecIdentityRef)identity
+                                                supportingCerts: (nullable NSArray*)certs
+{
+    return [[CBLClientCertAuthorizer alloc] initWithIdentity: identity
+                                             supportingCerts: certs];
+}
+
++ (id<CBLAuthenticator>) SSLClientCertAuthenticatorWithAnonymousIdentity: (NSString*)label {
+    SecIdentityRef identity = MYGetOrCreateAnonymousIdentity(label,
+                                                     kMYAnonymousIdentityDefaultExpirationInterval,
+                                                     NULL);
+    if (!identity)
+        return nil;
+    return [self SSLClientCertAuthenticatorWithIdentity: identity supportingCerts: nil];
 }
 
 
